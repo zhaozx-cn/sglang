@@ -629,6 +629,7 @@ class ServerArgs:
     enable_single_batch_overlap: bool = False
     tbo_token_distribution_threshold: float = 0.48
     enable_torch_compile: bool = False
+    enable_piecewise_cuda_graph: bool = False
     disable_piecewise_cuda_graph: bool = False
     enforce_piecewise_cuda_graph: bool = False
     enable_torch_compile_debug_mode: bool = False
@@ -1116,6 +1117,10 @@ class ServerArgs:
         # 16. Expert distribution recorder
         if self.enable_eplb or self.expert_distribution_recorder_mode is not None:
             self.disable_piecewise_cuda_graph = True
+
+        # NPU can use this function when the piece cuda graph is explicitly declared
+        if self.enable_piecewise_cuda_graph:
+            self.disable_piecewise_cuda_graph = False
 
     def _handle_gpu_memory_settings(self, gpu_mem):
         """
@@ -5391,8 +5396,8 @@ class ServerArgs:
         )
         parser.add_argument(
             "--enable-piecewise-cuda-graph",
-            action=DeprecatedAction,
-            help="Deprecated: Piecewise cuda graph is enabled by default. Use --enforce-piecewise-cuda-graph to skip auto-disable conditions.",
+            action="store_true",
+            help="Optimize the model with piecewise cuda graph for extend/prefill only.",
         )
         parser.add_argument(
             "--enforce-piecewise-cuda-graph",
