@@ -842,6 +842,8 @@ def decode_video_base64(video_base64):
             0,
             0,
         )  # Return an empty array and size tuple if no frames were found
+
+
 image_extension_names = (".png", ".jpg", ".jpeg", ".webp", ".gif")
 
 
