@@ -140,8 +140,15 @@ def npu_wrapper_preprocess(func):
             # Start of modifications for sglang  #
             ######################################
             flatten_patches = transform_patches_to_flatten(
-                patches, batch_size, grid_t, temporal_patch_size, channel,
-                grid_h, grid_w, patch_size, merge_size
+                patches,
+                batch_size,
+                grid_t,
+                temporal_patch_size,
+                channel,
+                grid_h,
+                grid_w,
+                patch_size,
+                merge_size,
             )
             ######################################
             #  End of modifications for sglang   #
@@ -249,8 +256,15 @@ def npu_wrapper_video_preprocess(func):
             # Start of modifications for sglang  #
             ######################################
             flatten_patches = transform_patches_to_flatten(
-                patches, batch_size, grid_t, temporal_patch_size, channel,
-                grid_h, grid_w, patch_size, merge_size
+                patches,
+                batch_size,
+                grid_t,
+                temporal_patch_size,
+                channel,
+                grid_h,
+                grid_w,
+                patch_size,
+                merge_size,
             )
             ######################################
             #  End of modifications for sglang   #
