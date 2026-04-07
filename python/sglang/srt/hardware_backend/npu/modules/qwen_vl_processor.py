@@ -23,6 +23,46 @@ from transformers.video_utils import group_videos_by_shape, reorder_videos
 from sglang.srt.utils import apply_module_patch
 
 
+def transform_patches_to_flatten(
+    patches: torch.Tensor,
+    batch_size: int,
+    grid_t: int,
+    temporal_patch_size: int,
+    channel: int,
+    grid_h: int,
+    grid_w: int,
+    patch_size: int,
+    merge_size: int,
+) -> torch.Tensor:
+    patches = patches.view(
+        batch_size * grid_t,
+        temporal_patch_size * channel,
+        grid_h // merge_size,
+        merge_size,
+        patch_size,
+        grid_w // merge_size,
+        merge_size,
+        patch_size,
+    )
+    patches = patches.permute(0, 1, 2, 5, 3, 6, 4, 7)
+    patches = patches.reshape(
+        batch_size,
+        grid_t,
+        temporal_patch_size,
+        channel,
+        grid_h * grid_w,
+        patch_size,
+        patch_size,
+    )
+    patches = patches.permute(0, 1, 4, 3, 2, 5, 6)
+    flatten_patches = patches.reshape(
+        batch_size,
+        grid_t * grid_h * grid_w,
+        -1,
+    )
+    return flatten_patches
+
+
 # Func refers to transformers.models.qwen2_vl.image_processing_qwen2_vl_fast.py
 # Qwen2VLImageProcessorFast._preprocess
 def npu_wrapper_preprocess(func):
@@ -99,31 +139,9 @@ def npu_wrapper_preprocess(func):
             ######################################
             # Start of modifications for sglang  #
             ######################################
-            patches = patches.view(
-                batch_size * grid_t,
-                temporal_patch_size * channel,
-                grid_h // merge_size,
-                merge_size,
-                patch_size,
-                grid_w // merge_size,
-                merge_size,
-                patch_size,
-            )
-            patches = patches.permute(0, 1, 2, 5, 3, 6, 4, 7)
-            patches = patches.reshape(
-                batch_size,
-                grid_t,
-                temporal_patch_size,
-                channel,
-                grid_h * grid_w,
-                patch_size,
-                patch_size,
-            )
-            patches = patches.permute(0, 1, 4, 3, 2, 5, 6)
-            flatten_patches = patches.reshape(
-                batch_size,
-                grid_t * grid_h * grid_w,
-                -1,
+            flatten_patches = transform_patches_to_flatten(
+                patches, batch_size, grid_t, temporal_patch_size, channel,
+                grid_h, grid_w, patch_size, merge_size
             )
             ######################################
             #  End of modifications for sglang   #
@@ -230,31 +248,9 @@ def npu_wrapper_video_preprocess(func):
             ######################################
             # Start of modifications for sglang  #
             ######################################
-            patches = patches.view(
-                batch_size * grid_t,
-                temporal_patch_size * channel,
-                grid_h // merge_size,
-                merge_size,
-                patch_size,
-                grid_w // merge_size,
-                merge_size,
-                patch_size,
-            )
-            patches = patches.permute(0, 1, 2, 5, 3, 6, 4, 7)
-            patches = patches.reshape(
-                batch_size,
-                grid_t,
-                temporal_patch_size,
-                channel,
-                grid_h * grid_w,
-                patch_size,
-                patch_size,
-            )
-            patches = patches.permute(0, 1, 4, 3, 2, 5, 6)
-            flatten_patches = patches.reshape(
-                batch_size,
-                grid_t * grid_h * grid_w,
-                -1,
+            flatten_patches = transform_patches_to_flatten(
+                patches, batch_size, grid_t, temporal_patch_size, channel,
+                grid_h, grid_w, patch_size, merge_size
             )
             ######################################
             #  End of modifications for sglang   #
