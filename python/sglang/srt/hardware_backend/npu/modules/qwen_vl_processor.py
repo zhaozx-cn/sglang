@@ -214,7 +214,7 @@ def npu_wrapper_video_preprocess(func):
                 rescale_factor,
                 do_normalize,
                 image_mean,
-                image_std
+                image_std,
             )
             patches = stacked_videos
 
@@ -275,7 +275,7 @@ def npu_wrapper_video_preprocess(func):
         }
 
         return BatchFeature(data=data, tensor_type=return_tensors)
-    
+
     return _preprocess
 
 
