@@ -26,7 +26,7 @@ from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_kv_cache
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.spec_info import SpecInput
-from sglang.srt.utils import get_bool_env_var
+from sglang.srt.utils import get_bool_env_var, get_current_device_stream_fast
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -217,7 +217,8 @@ def _cp_allgather_and_save_kv_npu(forward_batch, layer, k, v, cp_size):
     k shape: [S_local, tp_k_head_num, qk_head_dim]
     v shape: [S_local, tp_v_head_num, v_head_dim]
 
-    Equivalent to cp_allgather_and_save_kv_cache() in cp_utils.py but uses
+    Equivalent to cp_allgather_and_save_kv_cache() in cp_utils.py, but uses
+    a single all-gather for both K and V.
     """
     cache_loc = (
         forward_batch.out_cache_loc
@@ -230,13 +231,13 @@ def _cp_allgather_and_save_kv_npu(forward_batch, layer, k, v, cp_size):
 
     # Flatten trailing dims then concat → one all-gather instead of two.
     # Works for GQA where tp_k_head_num != tp_v_head_num.
-    k_flat = k.contiguous().reshape(k.shape[0], -1)   # [S_local, k_feat]
-    v_flat = v.contiguous().reshape(v.shape[0], -1)   # [S_local, v_feat]
+    k_flat = k.contiguous().reshape(k.shape[0], -1)  # [S_local, k_feat]
+    v_flat = v.contiguous().reshape(v.shape[0], -1)  # [S_local, v_feat]
     k_feat_size = k_flat.shape[-1]
-    kv_flat = torch.cat([k_flat, v_flat], dim=-1)     # [S_local, k_feat + v_feat]
+    kv_flat = torch.cat([k_flat, v_flat], dim=-1)  # [S_local, k_feat + v_feat]
 
     kv_full = cp_all_gather_rerange_kv_cache(
-        kv_flat, cp_size, forward_batch, torch.cuda.current_stream()
+        kv_flat, cp_size, forward_batch, get_current_device_stream_fast()
     )  # [S_full, k_feat + v_feat]
 
     key_cache_full = kv_full[..., :k_feat_size].reshape(-1, *k_tail)
@@ -808,12 +809,8 @@ class AscendAttnBackend(AttentionBackend):
         # torch.chunk(q, 2) gives ceil(n/2) and floor(n/2), matching
         # actual_seq_q_prev and actual_seq_q_next.
         q_prev, q_next = torch.chunk(q, 2, dim=0)
-        q_prev = q_prev.contiguous().reshape(
-            -1, layer.tp_q_head_num, layer.qk_head_dim
-        )
-        q_next = q_next.contiguous().reshape(
-            -1, layer.tp_q_head_num, layer.qk_head_dim
-        )
+        q_prev = q_prev.contiguous().reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
+        q_next = q_next.contiguous().reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
 
         k_cache_paged = k_cache.view(
             -1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim
@@ -831,7 +828,9 @@ class AscendAttnBackend(AttentionBackend):
             num_heads=layer.tp_q_head_num,
             num_key_value_heads=layer.tp_k_head_num,
             input_layout="TND",
-            atten_mask=None,
+            atten_mask=self.fia_mask,
+            sparse_mode=3,
+            next_tokens=0,
             scale=layer.scaling,
             actual_seq_lengths=[cp_meta.actual_seq_q_prev],
             actual_seq_lengths_kv=[cp_meta.kv_len_prev],
@@ -846,7 +845,9 @@ class AscendAttnBackend(AttentionBackend):
             num_heads=layer.tp_q_head_num,
             num_key_value_heads=layer.tp_k_head_num,
             input_layout="TND",
-            atten_mask=None,
+            atten_mask=self.fia_mask,
+            sparse_mode=3,
+            next_tokens=0,
             scale=layer.scaling,
             actual_seq_lengths=[cp_meta.actual_seq_q_next],
             actual_seq_lengths_kv=[cp_meta.kv_len_next],
