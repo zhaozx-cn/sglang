@@ -1,4 +1,4 @@
-from typing import Optional, Union
+from typing import Optional
 
 import torch
 import torchvision.transforms.v2.functional as tvF
@@ -7,11 +7,18 @@ from transformers.image_processing_utils_fast import (
     group_images_by_shape,
     reorder_images,
 )
-from transformers.image_utils import SizeDict, ChannelDimension, get_image_size, PILImageResampling
-from transformers.video_utils import group_videos_by_shape, reorder_videos
+from transformers.image_utils import (
+    ChannelDimension,
+    PILImageResampling,
+    SizeDict,
+    get_image_size,
+)
 from transformers.models.qwen2_vl.image_processing_qwen2_vl import smart_resize
-from transformers.models.qwen3_vl.video_processing_qwen3_vl import smart_resize as smart_resize_video
+from transformers.models.qwen3_vl.video_processing_qwen3_vl import (
+    smart_resize as smart_resize_video,
+)
 from transformers.utils import TensorType
+from transformers.video_utils import group_videos_by_shape, reorder_videos
 
 from sglang.srt.utils import apply_module_patch
 
@@ -184,7 +191,9 @@ def npu_wrapper_video_preprocess(func):
                     size=SizeDict(height=resized_height, width=resized_width),
                     interpolation=interpolation,
                 )
-                stacked_videos = stacked_videos.view(B, T, C, resized_height, resized_width)
+                stacked_videos = stacked_videos.view(
+                    B, T, C, resized_height, resized_width
+                )
             resized_videos_grouped[shape] = stacked_videos
         resized_videos = reorder_videos(resized_videos_grouped, grouped_videos_index)
 
@@ -194,11 +203,18 @@ def npu_wrapper_video_preprocess(func):
         processed_videos_grouped = {}
         processed_grids = {}
         for shape, stacked_videos in grouped_videos.items():
-            resized_height, resized_width = get_image_size(stacked_videos[0], channel_dim=ChannelDimension.FIRST)
+            resized_height, resized_width = get_image_size(
+                stacked_videos[0], channel_dim=ChannelDimension.FIRST
+            )
 
             # Fused rescale and normalize
             stacked_videos = self.rescale_and_normalize(
-                stacked_videos, do_rescale, rescale_factor, do_normalize, image_mean, image_std
+                stacked_videos,
+                do_rescale,
+                rescale_factor,
+                do_normalize,
+                image_mean,
+                image_std
             )
             patches = stacked_videos
 
@@ -247,7 +263,9 @@ def npu_wrapper_video_preprocess(func):
             processed_videos_grouped[shape] = flatten_patches
             processed_grids[shape] = [[grid_t, grid_h, grid_w]] * batch_size
 
-        processed_videos = reorder_videos(processed_videos_grouped, grouped_videos_index)
+        processed_videos = reorder_videos(
+            processed_videos_grouped, grouped_videos_index
+        )
         processed_grids = reorder_videos(processed_grids, grouped_videos_index)
         pixel_values_videos = torch.cat(processed_videos, dim=0)
         video_grid_thw = torch.tensor(processed_grids)
