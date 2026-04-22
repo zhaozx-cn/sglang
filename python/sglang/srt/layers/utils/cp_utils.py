@@ -2,6 +2,8 @@ from dataclasses import dataclass
 from itertools import accumulate
 from typing import Callable, List
 
+import numpy as np
+
 import torch
 import torch.nn.functional as F
 
@@ -38,6 +40,16 @@ class ContextParallelMetadata:
 
     total_seq_lens: torch.Tensor = None
 
+    # metadata for hybrid attention
+    is_hybrid: bool = False
+    hybrid_index: List[int] = None
+    # restore the full sequence across all pcp ranks
+    # when entering from linear-attention to attention
+    pcp_enter_fa_restore_idx: torch.Tensor = None
+    
+    # the number of tokens padded in linear-attn per rank
+    pcp_padded_tokens_fla: int = 0
+
 
 def is_prefill_context_parallel_enabled():
     return get_global_server_args().enable_prefill_context_parallel
@@ -65,7 +77,7 @@ def can_cp_split(seq_len: int, cp_size: int, forward_batch):
         return False
 
 
-def cp_split_and_rebuild_data(forward_batch, input_: torch.Tensor):
+def cp_split_and_rebuild_data(forward_batch, input_: torch.Tensor, is_hybrid = False):
     from sglang.srt.layers.attention.nsa.utils import (
         is_nsa_prefill_cp_round_robin_split,
         nsa_cp_round_robin_split_data,
@@ -81,13 +93,18 @@ def cp_split_and_rebuild_data(forward_batch, input_: torch.Tensor):
     input_list = list(
         torch.split(input_, forward_batch.attn_cp_metadata.split_list, dim=0)
     )
-    result = torch.cat(
-        [input_list[i] for i in forward_batch.attn_cp_metadata.zigzag_index], dim=0
-    ).view(-1, input_.shape[-1])
+    if not is_hybrid:
+        result = torch.cat(
+            [input_list[i] for i in forward_batch.attn_cp_metadata.zigzag_index], dim=0
+        ).view(-1, input_.shape[-1])
+    else:
+        result = torch.cat(
+            [input_list[i] for i in forward_batch.attn_cp_metadata.hybrid_index], dim=0
+        ).view(-1, input_.shape[-1])
     return result
 
 
-def cp_split_and_rebuild_position(forward_batch, positions: torch.Tensor):
+def cp_split_and_rebuild_position(forward_batch, positions: torch.Tensor, is_hybrid = False):
     from sglang.srt.layers.attention.nsa.utils import (
         is_nsa_prefill_cp_round_robin_split,
         nsa_cp_round_robin_split_data,
@@ -104,11 +121,48 @@ def cp_split_and_rebuild_position(forward_batch, positions: torch.Tensor):
     position_id_list = list(
         torch.split(positions, forward_batch.attn_cp_metadata.split_list, dim=-1)
     )
-    positions = torch.cat(
-        [position_id_list[i] for i in forward_batch.attn_cp_metadata.zigzag_index],
-        dim=-1,
-    )
+    if not is_hybrid:
+        positions = torch.cat(
+            [position_id_list[i] for i in forward_batch.attn_cp_metadata.zigzag_index],
+            dim=-1,
+        )
+    else:
+        positions = torch.cat(
+            [position_id_list[i] for i in forward_batch.attn_cp_metadata.hybrid_index],
+            dim=-1,
+        )
     return positions
+
+
+def cp_all_gather_reorganized_into_tensor_qkv_hybrid(
+    input_tensor, cp_size, forward_batch, stream
+):
+    """
+    Allgather communication for context_parallel KV cache.
+    Handles multi-dimensional tensors (e.g., [seq_len, num_heads, head_dim]).
+    """
+    pad_size = forward_batch.attn_cp_metadata.pcp_padded_tokens_fla
+    if pad_size > 0:
+        # Pad the first dimension (seq_len). F.pad expects padding in reverse dimension order.
+        # For n dimensional tensor, we need 2*n values: (last_dim_left, last_dim_right, ..., first_dim_left, first_dim_right)
+        # To pad only the first dimension: [0, 0] * (ndim - 1) + [0, pad_size]
+        padding = [0, 0] * (input_tensor.ndim - 1) + [0, pad_size]
+        input_tensor = F.pad(input_tensor, padding, mode="constant", value=0)
+    hybrid_input_len = input_tensor.shape[0]
+
+    # Create output tensor with proper shape for all dimensions
+    input_tensor_full = torch.empty(
+        hybrid_input_len * cp_size,
+        *input_tensor.shape[1:],
+        device=input_tensor.device,
+        dtype=input_tensor.dtype,
+    )
+
+    get_attention_cp_group().cp_all_gather_into_tensor_async(
+        input_tensor_full, input_tensor, stream
+    )
+
+    return input_tensor_full
 
 
 def cp_all_gather_reorganized_into_tensor(
@@ -207,6 +261,34 @@ def cp_all_gather_reorganized_into_tensor_kv_cache(
 
     return outputs
 
+
+def cp_all_gather_rerange_qkv_hybrid(input_tensor, cp_size, forward_batch, stream):
+    """
+    Allgather and reorganize KV cache from all ranks in context parallel group.
+
+    # for in-seq-split
+    |   +-----------before allgather------------+|
+    |   | dp_atten_tp0: block0, block7 |
+    |   | dp_atten_tp1: block1, block6 |
+    |   | dp_atten_tp2: block2, block5 |
+    |   | dp_atten_tp3: block3, block4 |
+    |
+    |   +----------before rerange---------------+|
+    | block0 | block7 | block1 | block6 | block2 | block5 | block3 | block4 |
+    |
+    |   +--------------result-------------------+
+    | block0 | block1 | block2 | block3 | block4 | block5 | block6 | block7 |
+    |   +-------------------------+
+    """
+    output_tensor = cp_all_gather_reorganized_into_tensor_qkv_hybrid(
+        input_tensor,
+        cp_size,
+        forward_batch,
+        stream,
+    )
+    output_tensor = torch.index_select(output_tensor, 0, forward_batch.attn_cp_metadata.pcp_enter_fa_restore_idx)
+    # No need to reshape - output_tensor already has the correct shape [seq_len, ...]
+    return output_tensor
 
 def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
     """
@@ -386,11 +468,44 @@ def cp_attn_forward_extend(
     return torch.concat([result_prev, result_next], dim=0)
 
 
+def _get_cumsum_and_arange(
+    num_scheduled_tokens: np.ndarray,
+    arange_np: np.ndarray,
+    cumsum_dtype: np.dtype | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Get the cumulative sum and batched arange of the given array.
+    # E.g., [2, 5, 3] -> ([2, 7, 10], [0, 1, 0, 1, 2, 3, 4, 0, 1, 2])
+    # Equivalent to but faster than:
+    # np.concatenate([np.arange(n) for n in num_scheduled_tokens])
+    """
+    # Step 1. [2, 5, 3] -> [2, 7, 10]
+    cu_num_tokens = np.cumsum(num_scheduled_tokens, dtype=cumsum_dtype)
+    total_num_tokens = cu_num_tokens[-1]
+    # Step 2. [2, 7, 10] -> [0, 0, 2, 2, 2, 2, 2, 7, 7, 7]
+    cumsums_offsets = np.repeat(cu_num_tokens - num_scheduled_tokens, num_scheduled_tokens)
+    # Step 3. [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
+    arange = arange_np[:total_num_tokens] - cumsums_offsets
+    return cu_num_tokens, arange
+
+
+def _get_cp_local_seq_lens(
+    split_list,
+) -> torch.Tensor:
+    """While using pcp or dcp, kv_cache size stored on each rank may be different,
+    use this function to calculate split decode seq_lens of each (p/d)cp rank.
+    """
+    split_list = np.array(split_list).reshape(-1,2)
+    cp_local_seq_lens = split_list.sum(axis=1)
+    padded_fla_num = cp_local_seq_lens.max() - cp_local_seq_lens
+    return cp_local_seq_lens, padded_fla_num
+
+
 def prepare_context_parallel_metadata(
     kv_len,
     cp_rank,
     cp_size,
     seqs_len,
+    is_hybrid = False,
 ):
     from sglang.srt.layers.attention.nsa.utils import (
         is_nsa_prefill_cp_round_robin_split,
@@ -441,6 +556,7 @@ def prepare_context_parallel_metadata(
     # "new" tokens). When radix/prefix cache hits, the effective KV length
     # visible to attention is: prefix_len + kv_len. CP attention must use the
     # full visible KV length, otherwise queries won't attend to cached prefix.
+    kv_max_rank_len = (kv_len + cp_size - 1) // cp_size
     kv_len = torch.tensor(kv_len)
     bs_per_cp_group = 1
     kv_len_origin = kv_len
@@ -529,6 +645,32 @@ def prepare_context_parallel_metadata(
         [actual_seq_q_next], device="cuda", dtype=torch.int32
     )
 
+    if is_hybrid:
+        bs_per_cp_group_hybrid = 2
+        hybrid_index = list(range(cp_segment_num))[cp_rank*bs_per_cp_group_hybrid:(cp_rank+1)*bs_per_cp_group_hybrid]
+
+        #build pcp_enter_fa_restore_idx
+        arange_np = np.arange(
+            8192,
+            dtype=np.int64,
+        )
+        cp_rank_seq_len, padded_fla_num = _get_cp_local_seq_lens(split_list)
+        pcp_padded_tokens_fla = padded_fla_num.tolist()[cp_rank]
+        _, prefill_arange_allranks = _get_cumsum_and_arange(
+            cp_rank_seq_len, arange_np
+        )
+        _, prefill_rank_offset = _get_cumsum_and_arange(
+            np.ones(1, dtype=np.int64) * cp_size, arange_np
+        )
+
+        prefill_all_offset = (
+            np.repeat(prefill_rank_offset * cp_rank_seq_len[0], cp_rank_seq_len)
+        )
+
+        # [0,1,2,3,4]  [0,1,M,M+1,2M,2M+1,3M,0,1,M,M+1,2M,3M]
+        pcp_enter_fa_restore_idx = np.add(prefill_all_offset, prefill_arange_allranks)
+        pcp_enter_fa_restore_idx = torch.from_numpy(pcp_enter_fa_restore_idx.astype(np.int32)).to(kv_len_prev_tensor.device)
+
     attn_cp_metadata = ContextParallelMetadata(
         split_list=split_list,
         max_rank_len=max_rank_len,
@@ -545,5 +687,9 @@ def prepare_context_parallel_metadata(
         actual_seq_q_prev_tensor=actual_seq_q_prev_tensor,
         actual_seq_q_next_tensor=actual_seq_q_next_tensor,
         total_seq_lens=kv_len_origin,
+        hybrid_index=hybrid_index,
+        is_hybrid=is_hybrid,
+        pcp_enter_fa_restore_idx=pcp_enter_fa_restore_idx,
+        pcp_padded_tokens_fla=pcp_padded_tokens_fla,
     )
     return attn_cp_metadata

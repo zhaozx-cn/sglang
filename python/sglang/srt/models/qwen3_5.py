@@ -34,7 +34,14 @@ from sglang.srt.configs.qwen3_5 import (
 )
 
 # Distributed
-from sglang.srt.distributed import get_pp_group
+from sglang.srt.distributed import (
+    get_pp_group,
+    get_attn_context_model_parallel_rank,
+    get_attn_context_model_parallel_world_size,
+    get_moe_data_parallel_world_size,
+    get_moe_tensor_parallel_rank,
+    get_moe_tensor_parallel_world_size,
+)
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 
@@ -62,6 +69,14 @@ from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.parameter import (
     BlockQuantScaleParameter,
     PerTensorScaleParameter,
+)
+from sglang.srt.layers.utils.cp_utils import (
+    can_cp_split,
+    is_prefill_context_parallel_enabled,
+    cp_split_and_rebuild_data,
+    cp_split_and_rebuild_position,
+    prepare_context_parallel_metadata,
+    cp_all_gather_rerange_qkv_hybrid,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -471,6 +486,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 lambda x: x.reshape(x.shape[0], -1), (query, key, value)
             )
             mixed_qkv = torch.cat((query, key, value), dim=-1)
+        #if torch.distributed.get_rank() == 0:
+        #    print(f"************rank {torch.distributed.get_rank()} mixed_qkv ",mixed_qkv[:,:10]," shape ",mixed_qkv.shape,flush=True)
         core_attn_out = self.attn(
             forward_batch,
             mixed_qkv=mixed_qkv,
@@ -481,8 +498,13 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         z_shape_og = z.shape
         # reshape input data into 2D tensor
         core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
+        #if torch.distributed.get_rank() % 2 == 0:
+            #torch.save(core_attn_out,f"/home/z00842572/sgl/acc-data/bad/core_attn_out_{self.layer_id}_{torch.distributed.get_rank()}.pt")
+        #    pass
         z = z.reshape(-1, z.shape[-1])
 
+        #if torch.distributed.get_rank() == 0:
+        #    print(f"*************rank {torch.distributed.get_rank()} core_attn_out ",core_attn_out.shape," z ",z.shape,flush=True)
         # Add padding for DP-Attn
         if core_attn_out.shape != z.shape:
             core_attn_out_pad = torch.zeros_like(z)
@@ -493,6 +515,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         core_attn_out = core_attn_out.reshape(z_shape_og)
         core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-2], -1)
 
+        #if torch.distributed.get_rank() == 0:
+        #    print(f"*************rank {torch.distributed.get_rank()} before o core_attn_out ",core_attn_out[:,:10]," shape ",core_attn_out.shape,flush=True)
         output, _ = self.out_proj(core_attn_out)
         return output
 
@@ -512,6 +536,8 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         super().__init__()
         self.config = config
         self.layer_id = layer_id
+        self.tp_size = get_moe_tensor_parallel_world_size()
+        self.tp_rank = get_moe_tensor_parallel_rank()
 
         linear_attn_quant_config = (
             None
@@ -543,6 +569,8 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
+                tp_rank=self.tp_rank,
+                tp_size=self.tp_size,
                 prefix=add_prefix("mlp", prefix.replace(".linear_attn", "")),
             )
             is_layer_sparse = False
@@ -601,6 +629,9 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             hidden_states, residual, forward_batch
         )
 
+        #if torch.distributed.get_rank() == 0:
+        #    print(f"*************rank {torch.distributed.get_rank()} after prepare mlp ",hidden_states[:,:10]," shape ",hidden_states.shape,flush=True)
+            #torch.save(hidden_states,f"/home/z00842572/sgl/acc-data/bad/after_prepare_mlp_{self.layer_id}.pt")
         use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
             forward_batch
         )
@@ -621,6 +652,9 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             hidden_states = self.mlp(
                 hidden_states, should_allreduce_fusion, use_reduce_scatter
             )
+        if torch.distributed.get_rank() == 2:
+            #torch.save(hidden_states,f"/home/z00842572/sgl/acc-data/bad/after_mlp_{self.layer_id}.pt")
+            pass
         if should_allreduce_fusion:
             hidden_states._sglang_needs_allreduce_fusion = True
         else:
@@ -731,6 +765,8 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
+                tp_rank=self.attn_tp_rank,
+                tp_size=self.attn_tp_size,
                 prefix=add_prefix("mlp", prefix.replace(".self_attn", "")),
             )
             is_layer_sparse = False
@@ -861,6 +897,11 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
+        #if torch.distributed.get_rank() == 0:
+        #    print(f"************rank {torch.distributed.get_rank()} after prepare mlp hidden_states ",hidden_states[:,:10]," shape ",hidden_states.shape,flush=True)
+        if torch.distributed.get_rank() == 2:
+            #torch.save(hidden_states,f"/home/z00842572/sgl/acc-data/bad/after_prepare_mlp_{self.layer_id}.pt")
+            pass
         use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
             forward_batch
         )
@@ -881,6 +922,9 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             hidden_states = self.mlp(
                 hidden_states, should_allreduce_fusion, use_reduce_scatter
             )
+        if torch.distributed.get_rank() == 2:
+            #torch.save(hidden_states,f"/home/z00842572/sgl/acc-data/bad/after_mlp_{self.layer_id}.pt")
+            pass
         if should_allreduce_fusion:
             hidden_states._sglang_needs_allreduce_fusion = True
         else:
@@ -919,6 +963,13 @@ class Qwen3_5ForCausalLM(nn.Module):
         self.config = config
         self.hidden_size = config.hidden_size
         self.pp_group = get_pp_group()
+        self.attn_cp_size = get_attn_context_model_parallel_world_size()
+        self.attn_cp_rank = get_attn_context_model_parallel_rank()
+        self.moe_dp_size = get_moe_data_parallel_world_size()
+
+        assert (
+            self.attn_cp_size == self.moe_dp_size
+        ), "Attention context parallel size must be equal to MoE context parallel size"
 
         alt_stream = torch.cuda.Stream() if _is_cuda else None
 
@@ -993,6 +1044,15 @@ class Qwen3_5ForCausalLM(nn.Module):
         input_deepstack_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
         # Initialize hidden states
+        if is_prefill_context_parallel_enabled():
+            if can_cp_split(input_embeds.shape[0], self.attn_cp_size, forward_batch):
+                forward_batch.attn_cp_metadata = prepare_context_parallel_metadata(
+                    input_embeds.shape[0],
+                    self.attn_cp_rank,
+                    self.attn_cp_size,
+                    forward_batch.seq_lens_cpu.tolist(),
+                    is_hybrid=True,
+                )
         if self.pp_group.is_first_rank:
             if input_embeds is None:
                 hidden_states = self.embed_tokens(input_ids)
@@ -1004,6 +1064,17 @@ class Qwen3_5ForCausalLM(nn.Module):
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
 
+        if (
+            is_prefill_context_parallel_enabled()
+            and forward_batch.forward_mode.is_context_parallel_extend()
+            and forward_batch.attn_cp_metadata is not None
+        ):
+            if self.pp_group.is_first_rank:
+                hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states, is_hybrid=True)
+            positions = cp_split_and_rebuild_position(forward_batch, positions, is_hybrid=True)
+        
+        #if torch.distributed.get_rank() == 0:
+        #    print(f"************rank {torch.distributed.get_rank()} model input hidden_states ",hidden_states[:,:10]," shape ",hidden_states.shape,flush=True)
         aux_hidden_states = []
         # Pass through decoder layers
         for layer_idx in range(self.start_layer, self.end_layer):
@@ -1042,7 +1113,7 @@ class Qwen3_5ForCausalLM(nn.Module):
                     "residual": residual,
                 }
             )
-
+        
         # Apply final normalization
         if hidden_states.shape[0] != 0:
             if residual is None:
@@ -1050,6 +1121,21 @@ class Qwen3_5ForCausalLM(nn.Module):
             else:
                 hidden_states, _ = self.norm(hidden_states, residual)
 
+        if (
+            self.pp_group.is_last_rank
+            and is_prefill_context_parallel_enabled()
+            and forward_batch.forward_mode.is_context_parallel_extend()
+            and forward_batch.attn_cp_metadata is not None
+        ):
+            hidden_states = cp_all_gather_rerange_qkv_hybrid(
+                hidden_states,
+                self.attn_cp_size,
+                forward_batch,
+                torch.cuda.current_stream(),
+            )
+        #if torch.distributed.get_rank() == 2:
+            #torch.save(hidden_states,"/home/z00842572/sgl/acc-data/bad/model_output.pt")
+        #    pass
         if len(aux_hidden_states) == 0:
             return hidden_states
 

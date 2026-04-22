@@ -33,8 +33,8 @@ if is_cuda():
 
     causal_conv1d_fn = causal_conv1d_fn_cuda
 elif is_npu():
-    from sgl_kernel_npu.fla.fused_gdn_gating import fused_gdn_gating_npu
-    from sgl_kernel_npu.mamba.causal_conv1d import (
+    from sglang.srt.hardware_backend.npu.attention.fla.fused_gdn_gating import fused_gdn_gating_npu
+    from sglang.srt.hardware_backend.npu.mamba.causal_conv1d import (
         causal_conv1d_fn_npu,
         causal_conv1d_update_npu,
     )
@@ -467,6 +467,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 last_recurrent_state = last_recurrent_state.to(
                     ssm_states.dtype, copy=False
                 )
+                #print(f"***************rank {torch.distributed.get_rank()} cache_indices ",cache_indices,flush=True)
+                #print(f"***************rank {torch.distributed.get_rank()} last_recurrent_state ",last_recurrent_state.reshape(-1,last_recurrent_state.shape[-1])[0:5,:10],flush=True)
                 ssm_states[cache_indices] = last_recurrent_state
 
             if h is not None:

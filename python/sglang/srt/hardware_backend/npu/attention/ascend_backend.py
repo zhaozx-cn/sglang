@@ -23,7 +23,7 @@ from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
-from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_kv_cache
+from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_kv_cache, cp_all_gather_rerange_qkv_hybrid, cp_split_and_rebuild_data, cp_all_gather_rerange_output
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import get_bool_env_var, get_current_device_stream_fast
@@ -250,6 +250,63 @@ def _cp_allgather_and_save_kv_npu(forward_batch, layer, k, v, cp_size):
         value_cache_full,
     )
 
+
+def _cp_allgather_and_save_kv_npu_bybrid(forward_batch, layer, q, k, v, cp_size):
+    """NPU-compatible CP KV all-gather with merged K/V communication.
+
+    Merges K and V along the feature dimension so only one all-gather is
+    needed instead of two, halving communication latency.
+
+    k shape: [S_local, tp_k_head_num, qk_head_dim]
+    v shape: [S_local, tp_v_head_num, v_head_dim]
+
+    Equivalent to cp_allgather_and_save_kv_cache() in cp_utils.py, but uses
+    a single all-gather for both K and V.
+    """
+    cache_loc = (
+        forward_batch.out_cache_loc
+        if not layer.is_cross_attention
+        else forward_batch.encoder_out_cache_loc
+    )
+    # Save original trailing shapes for reshape after gather.
+    q_tail = q.shape[1:]  # (tp_q_head_num, qk_head_dim)
+    k_tail = k.shape[1:]  # (tp_k_head_num, qk_head_dim)
+    v_tail = v.shape[1:]  # (tp_v_head_num, v_head_dim)
+
+    # Flatten trailing dims then concat → one all-gather instead of two.
+    # Works for GQA where tp_k_head_num != tp_v_head_num.
+    q_flat = q.contiguous().reshape(q.shape[0], -1)
+    k_flat = k.contiguous().reshape(k.shape[0], -1)  # [S_local, k_feat]
+    v_flat = v.contiguous().reshape(v.shape[0], -1)  # [S_local, v_feat]
+    q_feat_size = q_flat.shape[-1]
+    k_feat_size = k_flat.shape[-1]
+    v_feat_size = v_flat.shape[-1]
+    qkv_flat = torch.cat([q_flat, k_flat, v_flat], dim=-1)  # [S_local, k_feat + v_feat]
+
+    qkv_full = cp_all_gather_rerange_qkv_hybrid(
+        qkv_flat, cp_size, forward_batch, get_current_device_stream_fast()
+    )  # [S_full, k_feat + v_feat]
+
+    q, k, v = qkv_full.split(
+            [
+                q_feat_size,
+                k_feat_size,
+                v_feat_size,
+            ],
+            dim=-1,
+        )
+    q = cp_split_and_rebuild_data(forward_batch, q, is_hybrid=False)
+    query_cache_full = q.reshape(-1, *q_tail)
+    key_cache_full = k.reshape(-1, *k_tail)
+    value_cache_full = v.reshape(-1, *v_tail)
+
+    forward_batch.token_to_kv_pool.set_kv_buffer(
+        layer,
+        cache_loc,
+        key_cache_full,
+        value_cache_full,
+    )
+    return query_cache_full
 
 class AscendAttnBackend(AttentionBackend):
 
@@ -853,8 +910,17 @@ class AscendAttnBackend(AttentionBackend):
             actual_seq_lengths_kv=[cp_meta.kv_len_next],
         )
 
-        attn_out = torch.cat([attn_out_prev, attn_out_next], dim=0)
-        return attn_out.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+        attn_out = torch.cat([attn_out_prev, attn_out_next], dim=0).view(-1, layer.tp_q_head_num * layer.v_head_dim)
+        if cp_meta.is_hybrid:
+            attn_out = cp_all_gather_rerange_output(
+                attn_out,
+                self.attn_cp_size,
+                forward_batch,
+                torch.cuda.current_stream(),
+            )
+            attn_out = cp_split_and_rebuild_data(forward_batch, attn_out, is_hybrid=True)
+
+        return attn_out
 
     def forward_sparse(
         self,
@@ -1037,9 +1103,14 @@ class AscendAttnBackend(AttentionBackend):
             if save_kv_cache and k is not None and v is not None:
                 if is_cp_mode:
                     # All-gather K/V from all CP ranks and write full sequence to KV pool
-                    _cp_allgather_and_save_kv_npu(
-                        forward_batch, layer, k, v, self.attn_cp_size
-                    )
+                    if not forward_batch.attn_cp_metadata.is_hybrid:
+                        _cp_allgather_and_save_kv_npu(
+                            forward_batch, layer, k, v, self.attn_cp_size
+                        )
+                    else:
+                        q = _cp_allgather_and_save_kv_npu_bybrid(
+                            forward_batch, layer, q, k, v, self.attn_cp_size
+                        )
                 else:
                     # support cross attention
                     cache_loc = (
@@ -1083,6 +1154,7 @@ class AscendAttnBackend(AttentionBackend):
                         "CP attention for non-FIA path on Ascend is not yet implemented. "
                         "Set ASCEND_USE_FIA=1 to use FIA-based CP attention."
                     )
+                
                 return attn_output
 
             if self.use_fia:
