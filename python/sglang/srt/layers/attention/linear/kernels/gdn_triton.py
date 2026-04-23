@@ -15,7 +15,7 @@ if not is_cpu():
     )
 
 if is_npu():
-    from sgl_kernel_npu.fla.chunk import chunk_gated_delta_rule_npu
+    from sglang.srt.hardware_backend.npu.attention.fla.chunk import chunk_gated_delta_rule_npu
     from sgl_kernel_npu.fla.fused_sigmoid_gating_recurrent import (
         fused_sigmoid_gating_delta_rule_update_npu,
     )

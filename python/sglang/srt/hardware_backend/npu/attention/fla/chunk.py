@@ -237,6 +237,42 @@ def chunk_gated_delta_rule_fwd(
         output_final_state=output_final_state,
         cu_seqlens=cu_seqlens,
     )
+    if get_attention_cp_group().world_size > 1:
+        h_update = chunk_gated_delta_rule_fwd_hupdate(
+            k=k,
+            w=w,
+            u=u,
+            g=g,
+            cu_seqlens=cu_seqlens,
+        )
+        all_final_state = get_attention_cp_group().all_gather(final_state.unsqueeze(0), 0)
+        final_chunk_indices = prepare_final_chunk_indices(cu_seqlens, chunk_size)
+        final_h_update = h_update[:, final_chunk_indices, :, :, :]
+        all_final_h_update = get_attention_cp_group().all_gather(final_h_update, 0)
+
+        updated_state = final_state.new_empty(get_attention_cp_group().world_size, *final_state.shape)
+        updated_state[0, ...] = all_final_state[0]
+        for i in range(1, get_attention_cp_group().world_size):
+            updated_final_state = all_final_state[i] + torch.matmul(
+                all_final_h_update[i, ...], updated_state[i - 1, ...]
+            )
+            updated_state[i, ...] = updated_final_state
+
+        final_state = updated_state[-1, ...]
+
+        if get_attention_cp_group().rank_in_group == 0:
+            updated_h_state = torch.zeros_like(final_state)
+        else:
+            updated_h_state = updated_state[get_attention_cp_group().rank_in_group - 1, ...]
+
+        h = chunk_fwd_o_update(
+            q=q,
+            v=v_new,
+            h=h,
+            h_update=h_update,
+            updated_h_state=updated_h_state,
+            cu_seqlens=cu_seqlens,
+        )
     o = chunk_fwd_o(
         q=q,
         k=k,

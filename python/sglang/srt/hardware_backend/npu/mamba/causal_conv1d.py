@@ -12,6 +12,8 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
+from sglang.srt.layers.dp_attention import get_attention_cp_group
+
 PAD_SLOT_ID = -1
 
 
@@ -46,6 +48,8 @@ def causal_conv1d_fn_native(
     else:
         if x.ndim == 2:
             x = x.unsqueeze(0)
+        if initial_states.ndim == 2:
+            initial_states = initial_states.unsqueeze(0)
         x = torch.cat([initial_states, x], dim=-1)
         out = F.conv1d(x, weight.unsqueeze(1), bias, padding=0, groups=dim)
 
@@ -148,23 +152,36 @@ def causal_conv1d_fn_npu(
         x = x.contiguous()
     bias = bias.contiguous() if bias is not None else None
 
+    if get_attention_cp_group().world_size > 1:
+        query_start_loc[-1] = x.shape[-1]
+    
     assert query_start_loc[-1] <= x.shape[-1], f"{query_start_loc=}, {x.shape=}"
 
+    last_width_prefill_x = extract_last_width(x, query_start_loc[0:], conv_states.shape[-1])
+    if get_attention_cp_group().world_size > 1:
+        all_last_width_prefill_x = get_attention_cp_group().all_gather(last_width_prefill_x.unsqueeze(0).contiguous(), 0)
+        pcp_rank = get_attention_cp_group().rank_in_group
+        if pcp_rank > 0:
+            conv_states[cache_indices[0]] = all_last_width_prefill_x[pcp_rank - 1, ...]
+    
     x_pad, initial_state_pad, seqlens, indices = prepare_data(
         x, weight, query_start_loc, cache_indices, has_initial_state, conv_states
     )
 
+    width = weight.shape[1]
     out, final_states_out = causal_conv1d_fn_native(
         x_pad,
         weight,
         bias,
         seqlens=seqlens,
         has_initial_state=has_initial_state,
-        initial_states=initial_state_pad,
+        initial_states=conv_states[cache_indices[0]][..., : (width - 1)] if get_attention_cp_group().world_size > 1 else initial_state_pad,
         activation=activation,
         return_final_states=True,
     )
     conv_states.index_copy_(0, cache_indices, final_states_out)
+    if get_attention_cp_group().world_size > 1:
+        conv_states[cache_indices[0]] = all_last_width_prefill_x[-1, ...]
 
     if x.ndim == 3:
         return out  # [batch_size, dim, seq_len]
@@ -178,6 +195,12 @@ def causal_conv1d_fn_npu(
 
     return out_final  # [dim, cu_seq_len]
 
+
+def extract_last_width(x, start_loc, width):
+    end_loc = start_loc[1:]
+    offsets = torch.arange(width, device=x.device)
+    indices = end_loc.unsqueeze(1) - width + offsets.unsqueeze(0)  # (num_seqs, width)
+    return x[:, indices].permute(1, 0, 2)
 
 @triton.jit()
 def _causal_conv1d_update_kernel_no_cache_len_no_mtp(
