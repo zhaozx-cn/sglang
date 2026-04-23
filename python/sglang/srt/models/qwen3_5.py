@@ -1060,6 +1060,13 @@ class Qwen3_5ForCausalLM(nn.Module):
                 }
             )
 
+        # Apply final normalization
+        if hidden_states.shape[0] != 0:
+            if residual is None:
+                hidden_states = self.norm(hidden_states)
+            else:
+                hidden_states, _ = self.norm(hidden_states, residual)
+
         if (
             self.pp_group.is_last_rank
             and is_prefill_context_parallel_enabled()
@@ -1072,13 +1079,7 @@ class Qwen3_5ForCausalLM(nn.Module):
                 forward_batch,
                 torch.cuda.current_stream(),
             )
-        # Apply final normalization
-        if hidden_states.shape[0] != 0:
-            if residual is None:
-                hidden_states = self.norm(hidden_states)
-            else:
-                hidden_states, _ = self.norm(hidden_states, residual)
-
+            
         return hidden_states
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
