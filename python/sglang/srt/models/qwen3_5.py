@@ -34,7 +34,14 @@ from sglang.srt.configs.qwen3_5 import (
 )
 
 # Distributed
-from sglang.srt.distributed import get_pp_group
+from sglang.srt.distributed import (
+    get_pp_group,
+    get_attn_context_model_parallel_rank,
+    get_attn_context_model_parallel_world_size,
+    get_moe_data_parallel_world_size,
+    get_moe_tensor_parallel_rank,
+    get_moe_tensor_parallel_world_size,
+)
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 
@@ -62,6 +69,14 @@ from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.parameter import (
     BlockQuantScaleParameter,
     PerTensorScaleParameter,
+)
+from sglang.srt.layers.utils.cp_utils import (
+    can_cp_split,
+    is_prefill_context_parallel_enabled,
+    cp_split_and_rebuild_data,
+    cp_split_and_rebuild_position,
+    prepare_context_parallel_metadata,
+    cp_all_gather_rerange_qkv_hybrid,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -522,6 +537,8 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         super().__init__()
         self.config = config
         self.layer_id = layer_id
+        self.tp_size = get_moe_tensor_parallel_world_size()
+        self.tp_rank = get_moe_tensor_parallel_rank()
 
         linear_attn_quant_config = (
             None
@@ -553,6 +570,8 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix.replace(".linear_attn", "")),
+                tp_rank=self.attn_tp_rank,
+                tp_size=self.attn_tp_size,
             )
             is_layer_sparse = False
             is_previous_layer_sparse = False
@@ -734,6 +753,8 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix.replace(".self_attn", "")),
+                tp_rank=self.attn_tp_rank,
+                tp_size=self.attn_tp_size,
             )
             is_layer_sparse = False
             is_previous_layer_sparse = False
@@ -914,6 +935,13 @@ class Qwen3_5ForCausalLM(nn.Module):
         self.config = config
         self.hidden_size = config.hidden_size
         self.pp_group = get_pp_group()
+        self.attn_cp_size = get_attn_context_model_parallel_world_size()
+        self.attn_cp_rank = get_attn_context_model_parallel_rank()
+        self.moe_dp_size = get_moe_data_parallel_world_size()
+
+        assert (
+            self.attn_cp_size == self.moe_dp_size
+        ), "Attention context parallel size must be equal to MoE context parallel size"
 
         alt_stream = torch.cuda.Stream() if _is_cuda else None
 
@@ -980,6 +1008,15 @@ class Qwen3_5ForCausalLM(nn.Module):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
         input_deepstack_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
+        if is_prefill_context_parallel_enabled():
+            if can_cp_split(input_embeds.shape[0], self.attn_cp_size, forward_batch):
+                forward_batch.attn_cp_metadata = prepare_context_parallel_metadata(
+                    input_embeds.shape[0],
+                    self.attn_cp_rank,
+                    self.attn_cp_size,
+                    forward_batch.seq_lens_cpu.tolist(),
+                    is_hybrid=True,
+                )
         # Initialize hidden states
         if self.pp_group.is_first_rank:
             if input_embeds is None:
@@ -992,6 +1029,14 @@ class Qwen3_5ForCausalLM(nn.Module):
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
 
+        if (
+            is_prefill_context_parallel_enabled()
+            and forward_batch.forward_mode.is_context_parallel_extend()
+            and forward_batch.attn_cp_metadata is not None
+        ):
+            if self.pp_group.is_first_rank:
+                hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states, is_hybrid=True)
+            positions = cp_split_and_rebuild_position(forward_batch, positions, is_hybrid=True)
         # Pass through decoder layers
         for layer_idx in range(self.start_layer, self.end_layer):
             layer = self.layers[layer_idx]
@@ -1032,6 +1077,18 @@ class Qwen3_5ForCausalLM(nn.Module):
             else:
                 hidden_states, _ = self.norm(hidden_states, residual)
 
+        if (
+            self.pp_group.is_last_rank
+            and is_prefill_context_parallel_enabled()
+            and forward_batch.forward_mode.is_context_parallel_extend()
+            and forward_batch.attn_cp_metadata is not None
+        ):
+            hidden_states = cp_all_gather_rerange_qkv_hybrid(
+                hidden_states,
+                self.attn_cp_size,
+                forward_batch,
+                torch.cuda.current_stream(),
+            )
         return hidden_states
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):

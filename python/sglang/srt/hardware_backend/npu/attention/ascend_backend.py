@@ -10,6 +10,12 @@ from sgl_kernel_npu.attention.sinks_attention import (
     attention_sinks_triton,
 )
 
+from sglang.srt.layers.utils.cp_utils import (
+    cp_all_gather_rerange_kv_cache,
+    cp_all_gather_rerange_qkv_hybrid,
+    cp_split_and_rebuild_data,
+    cp_all_gather_rerange_output
+)
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.hardware_backend.npu.attention.ascend_torch_native_backend import (
@@ -25,7 +31,7 @@ from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.spec_info import SpecInput
-from sglang.srt.utils import get_bool_env_var
+from sglang.srt.utils import get_bool_env_var, get_current_device_stream_fast
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -41,6 +47,105 @@ def _reshape_kv_for_fia_nz(
 ) -> torch.Tensor:
     """Reshapes a tensor for FIA NZ format."""
     return tensor.view(-1, 1, num_heads * head_dim // 16, page_size, 16)
+
+def _cp_allgather_and_save_kv_npu(forward_batch, layer, k, v, cp_size):
+    """NPU-compatible CP KV all-gather with merged K/V communication.
+
+    Merges K and V along the feature dimension so only one all-gather is
+    needed instead of two, halving communication latency.
+
+    k shape: [S_local, tp_k_head_num, qk_head_dim]
+    v shape: [S_local, tp_v_head_num, v_head_dim]
+
+    Equivalent to cp_allgather_and_save_kv_cache() in cp_utils.py, but uses
+    a single all-gather for both K and V.
+    """
+    cache_loc = (
+        forward_batch.out_cache_loc
+        if not layer.is_cross_attention
+        else forward_batch.encoder_out_cache_loc
+    )
+    # Save original trailing shapes for reshape after gather.
+    k_tail = k.shape[1:]  # (tp_k_head_num, qk_head_dim)
+    v_tail = v.shape[1:]  # (tp_v_head_num, v_head_dim)
+
+    # Flatten trailing dims then concat → one all-gather instead of two.
+    # Works for GQA where tp_k_head_num != tp_v_head_num.
+    k_flat = k.contiguous().reshape(k.shape[0], -1)  # [S_local, k_feat]
+    v_flat = v.contiguous().reshape(v.shape[0], -1)  # [S_local, v_feat]
+    k_feat_size = k_flat.shape[-1]
+    kv_flat = torch.cat([k_flat, v_flat], dim=-1)  # [S_local, k_feat + v_feat]
+
+    kv_full = cp_all_gather_rerange_kv_cache(
+        kv_flat, cp_size, forward_batch, get_current_device_stream_fast()
+    )  # [S_full, k_feat + v_feat]
+
+    key_cache_full = kv_full[..., :k_feat_size].reshape(-1, *k_tail)
+    value_cache_full = kv_full[..., k_feat_size:].reshape(-1, *v_tail)
+
+    forward_batch.token_to_kv_pool.set_kv_buffer(
+        layer,
+        cache_loc,
+        key_cache_full,
+        value_cache_full,
+    )
+
+def _cp_allgather_and_save_kv_npu_bybrid(forward_batch, layer, q, k, v, cp_size):
+    """NPU-compatible CP KV all-gather with merged K/V communication.
+
+    Merges K and V along the feature dimension so only one all-gather is
+    needed instead of two, halving communication latency.
+
+    k shape: [S_local, tp_k_head_num, qk_head_dim]
+    v shape: [S_local, tp_v_head_num, v_head_dim]
+
+    Equivalent to cp_allgather_and_save_kv_cache() in cp_utils.py, but uses
+    a single all-gather for both K and V.
+    """
+    cache_loc = (
+        forward_batch.out_cache_loc
+        if not layer.is_cross_attention
+        else forward_batch.encoder_out_cache_loc
+    )
+    # Save original trailing shapes for reshape after gather.
+    q_tail = q.shape[1:]  # (tp_q_head_num, qk_head_dim)
+    k_tail = k.shape[1:]  # (tp_k_head_num, qk_head_dim)
+    v_tail = v.shape[1:]  # (tp_v_head_num, v_head_dim)
+
+    # Flatten trailing dims then concat → one all-gather instead of two.
+    # Works for GQA where tp_k_head_num != tp_v_head_num.
+    q_flat = q.contiguous().reshape(q.shape[0], -1)
+    k_flat = k.contiguous().reshape(k.shape[0], -1)  # [S_local, k_feat]
+    v_flat = v.contiguous().reshape(v.shape[0], -1)  # [S_local, v_feat]
+    q_feat_size = q_flat.shape[-1]
+    k_feat_size = k_flat.shape[-1]
+    v_feat_size = v_flat.shape[-1]
+    qkv_flat = torch.cat([q_flat, k_flat, v_flat], dim=-1)  # [S_local, k_feat + v_feat]
+
+    qkv_full = cp_all_gather_rerange_qkv_hybrid(
+        qkv_flat, cp_size, forward_batch, get_current_device_stream_fast()
+    )  # [S_full, k_feat + v_feat]
+
+    q, k, v = qkv_full.split(
+            [
+                q_feat_size,
+                k_feat_size,
+                v_feat_size,
+            ],
+            dim=-1,
+        )
+    q = cp_split_and_rebuild_data(forward_batch, q, is_hybrid=False)
+    query_cache_full = q.reshape(-1, *q_tail)
+    key_cache_full = k.reshape(-1, *k_tail)
+    value_cache_full = v.reshape(-1, *v_tail)
+
+    forward_batch.token_to_kv_pool.set_kv_buffer(
+        layer,
+        cache_loc,
+        key_cache_full,
+        value_cache_full,
+    )
+    return query_cache_full
 
 
 logger = logging.getLogger(__name__)
@@ -285,6 +390,8 @@ class AscendAttnBackend(AttentionBackend):
         if self.dllm_config is not None:
             self.is_dllm_model = True
             self.dllm_block_size = self.dllm_config.block_size
+        
+        self.attn_cp_size = model_runner.attn_cp_size
 
     def get_verify_buffers_to_fill_after_draft(self):
         """
@@ -666,6 +773,92 @@ class AscendAttnBackend(AttentionBackend):
         attn_output = attn_output.view(-1, num_heads * head_size)
         return attn_output
 
+    def do_cp_attn_fia(
+        self,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        layer: "RadixAttention",
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        """CP-aware attention for standard (non-MLA) models using FIA on Ascend NPU.
+
+        Uses npu_fused_infer_attention_score with paged KV cache (block_table).
+        The KV cache must already contain the full gathered sequence
+        (written by _cp_allgather_and_save_kv_npu before this call).
+
+        Args:
+            q:            Query tensor, shape [total_q_tokens, tp_q_head_num * qk_head_dim]
+            k_cache:      Full key cache from token_to_kv_pool
+            v_cache:      Full value cache from token_to_kv_pool
+            layer:        RadixAttention layer
+            forward_batch: ForwardBatch with attn_cp_metadata populated
+
+        Returns:
+            attn_output [total_q_tokens, tp_q_head_num * v_head_dim]
+        """
+        cp_meta = forward_batch.attn_cp_metadata
+
+        # Split Q into prev/next halves per zigzag pattern.
+        # torch.chunk(q, 2) gives ceil(n/2) and floor(n/2), matching
+        # actual_seq_q_prev and actual_seq_q_next.
+        q_prev, q_next = torch.chunk(q, 2, dim=0)
+        q_prev = q_prev.contiguous().reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
+        q_next = q_next.contiguous().reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
+
+        k_cache_paged = k_cache.view(
+            -1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim
+        )
+        v_cache_paged = v_cache.view(
+            -1, self.page_size, layer.tp_v_head_num * layer.v_head_dim
+        )
+
+        attn_out_prev, _ = torch.ops.npu.npu_fused_infer_attention_score(
+            q_prev,
+            k_cache_paged,
+            v_cache_paged,
+            block_table=self.forward_metadata.block_tables,
+            block_size=self.page_size,
+            num_heads=layer.tp_q_head_num,
+            num_key_value_heads=layer.tp_k_head_num,
+            input_layout="TND",
+            atten_mask=self.fia_mask,
+            sparse_mode=3,
+            next_tokens=0,
+            scale=layer.scaling,
+            actual_seq_lengths=[cp_meta.actual_seq_q_prev],
+            actual_seq_lengths_kv=[cp_meta.kv_len_prev],
+        )
+
+        attn_out_next, _ = torch.ops.npu.npu_fused_infer_attention_score(
+            q_next,
+            k_cache_paged,
+            v_cache_paged,
+            block_table=self.forward_metadata.block_tables,
+            block_size=self.page_size,
+            num_heads=layer.tp_q_head_num,
+            num_key_value_heads=layer.tp_k_head_num,
+            input_layout="TND",
+            atten_mask=self.fia_mask,
+            sparse_mode=3,
+            next_tokens=0,
+            scale=layer.scaling,
+            actual_seq_lengths=[cp_meta.actual_seq_q_next],
+            actual_seq_lengths_kv=[cp_meta.kv_len_next],
+        ) 
+
+        attn_out = torch.cat([attn_out_prev, attn_out_next], dim=0).view(-1, layer.tp_q_head_num * layer.v_head_dim)
+        if cp_meta.is_hybrid:
+            attn_out = cp_all_gather_rerange_output(
+                attn_out,
+                self.attn_cp_size,
+                forward_batch,
+                torch.cuda.current_stream(),
+            )
+            attn_out = cp_split_and_rebuild_data(forward_batch, attn_out, is_hybrid=True)
+
+        return attn_out
+    
     def do_cp_balance_attn(
         self,
         q_nope,
@@ -906,15 +1099,32 @@ class AscendAttnBackend(AttentionBackend):
             )
 
         if not self.use_mla:
+            is_cp_mode = (
+                forward_batch.forward_mode.is_context_parallel_extend()
+                and forward_batch.attn_cp_metadata is not None
+                and self.attn_cp_size > 1
+            )
             # In cross attention layer, when there is no vision input,the values of k and v is None
             if save_kv_cache and k is not None and v is not None:
                 # support cross attention
-                cache_loc = (
-                    forward_batch.out_cache_loc
-                    if not layer.is_cross_attention
-                    else forward_batch.encoder_out_cache_loc
-                )
-                forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
+                if is_cp_mode:
+                    # All-gather K/V from all CP ranks and write full sequence to KV pool
+                    if not forward_batch.attn_cp_metadata.is_hybrid:
+                        _cp_allgather_and_save_kv_npu(
+                            forward_batch, layer, k, v, self.attn_cp_size
+                        )
+                    else:
+                        q = _cp_allgather_and_save_kv_npu_bybrid(
+                            forward_batch, layer, q, k, v, self.attn_cp_size
+                        )
+                else:
+                    # support cross attention
+                    cache_loc = (
+                        forward_batch.out_cache_loc
+                        if not layer.is_cross_attention
+                        else forward_batch.encoder_out_cache_loc
+                    )
+                    forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
 
             k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
             v_cache = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
@@ -940,6 +1150,18 @@ class AscendAttnBackend(AttentionBackend):
                 )
                 return attn_out
 
+            if is_cp_mode:
+                if self.use_fia:
+                    attn_output = self.do_cp_attn_fia(
+                        q, k_cache, v_cache, layer, forward_batch
+                    )
+                else:
+                    raise NotImplementedError(
+                        "CP attention for non-FIA path on Ascend is not yet implemented. "
+                        "Set ASCEND_USE_FIA=1 to use FIA-based CP attention."
+                    )
+                return attn_output
+            
             if self.use_fia:
                 """FIA supports multi-bs in the current version of CANN"""
                 q = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
