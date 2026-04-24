@@ -570,8 +570,8 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix.replace(".linear_attn", "")),
-                tp_rank=self.attn_tp_rank,
-                tp_size=self.attn_tp_size,
+                tp_rank=self.tp_rank,
+                tp_size=self.tp_size,
             )
             is_layer_sparse = False
             is_previous_layer_sparse = False

@@ -2,10 +2,10 @@ from typing import Optional, Tuple, Union
 
 import torch
 from sgl_kernel_npu.fla.fused_gdn_gating import fused_gdn_gating_npu
+from sgl_kernel_npu.mamba.causal_conv1d import causal_conv1d_update_v2
 from sglang.srt.hardware_backend.npu.mamba.causal_conv1d import (
     causal_conv1d_fn_npu,
     causal_conv1d_update_npu,
-    causal_conv1d_update_v2,
 )
 
 from sglang.srt.layers.attention.fla.fused_gdn_gating import (

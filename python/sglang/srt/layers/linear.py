@@ -1513,7 +1513,7 @@ class RowParallelLinear(LinearBase):
             if self.use_dp_attention_reduce:
                 output = get_attention_tp_group().all_reduce(output_parallel)
             else:
-                output = moe_tensor_model_parallel_all_reduce,(output_parallel)
+                output = moe_tensor_model_parallel_all_reduce(output_parallel)
         else:
             output = output_parallel
 
