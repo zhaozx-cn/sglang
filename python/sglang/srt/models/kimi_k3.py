@@ -2620,6 +2620,36 @@ class KimiK3LinearModel(nn.Module):
         )
         sp_sharded = False
         aux_hidden_states = []
+        # MoE DRAM offload: toggle ExpertWeightStore cache mode between
+        # prefill (load all experts into shared HBM buffers via
+        # group_pack_copy) and decode (compact active experts on-device
+        # post-dispatch via group_pack_copy_active_weights). On the
+        # prefill->decode transition, release shared HBM buffers so HBM is
+        # returned to the caching allocator.
+        is_prefill = forward_batch.forward_mode.is_prefill()
+        released_any = False
+        for _li in range(self.start_layer, self.end_layer):
+            _moe = getattr(getattr(self.layers[_li], "mlp", None), "experts", None)
+            if (
+                _moe is not None
+                and getattr(_moe, "_dram_offload_enabled", False)
+                and getattr(_moe, "_expert_weight_store", None) is not None
+            ):
+                _store = _moe._expert_weight_store
+                _store.set_cache_mode(is_prefill)
+                # Detect prefill->decode transition: only release on the
+                # first decode forward after prefill, not every decode
+                # forward (which would cause alloc/free churn).
+                if not is_prefill and getattr(_moe, "_last_is_prefill", False):
+                    _moe._release_shared_hbm_buffers()
+                    released_any = True
+                _moe._last_is_prefill = is_prefill
+        if released_any:
+            import gc
+
+            gc.collect()
+            if torch.npu.is_available():
+                torch.npu.empty_cache()
         for i in range(self.start_layer, self.end_layer):
             if sp_sharded and not self.layers[i]._sp_moe:
                 hidden_states = _sp_all_gather_rows(hidden_states)

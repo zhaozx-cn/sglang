@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/a6221a144af772fd1a68fe7e627935dc53e81738/vllm/model_executor/layers/fused_moe/layer.py
 
+import contextlib
 import logging
 from enum import Enum
 from functools import cached_property
@@ -93,6 +94,8 @@ _is_cpu = is_cpu()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
+logger = logging.getLogger(__name__)
+
 # Log the deferred-finalize config at most once per process (rank). Different MoE
 # layers can resolve to different quant methods, so print_info_once (keyed on the
 # full message) would otherwise fire once per distinct quant method.
@@ -176,6 +179,46 @@ def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
         )
     else:
         raise NotImplementedError(f"Unsupported a2a backend: {a2a_backend}")
+
+
+@contextlib.contextmanager
+def _force_cpu_allocation():
+    """Force all torch tensor allocations to CPU.
+
+    On Ascend NPU, ``torch_npu/contrib/transfer_to_npu.py`` patches
+    ``torch.empty``/``torch.zeros``/``torch.ones`` etc. to redirect allocations
+    to NPU. The standard ``torch.device("cpu")`` context manager may not
+    reliably override this because the patched functions can bypass the
+    default-device mechanism.
+
+    This context manager monkey-patches the tensor-creation functions to
+    explicitly inject ``device='cpu'`` into kwargs when no device is specified,
+    ensuring weights are allocated on CPU regardless of any NPU contrib patches.
+    Used during ``create_weights`` when ``moe_dram_offload`` is enabled to avoid
+    allocating all 80 layers' expert weights on HBM simultaneously (which causes
+    OOM).
+    """
+    _torch_fns = ["empty", "zeros", "ones", "randn", "rand", "full",
+                  "arange", "linspace", "tensor"]
+    _saved = {}
+
+    def _make_patched(original_fn):
+        def _patched(*args, **kwargs):
+            if "device" not in kwargs or kwargs["device"] is None:
+                kwargs["device"] = "cpu"
+            return original_fn(*args, **kwargs)
+        return _patched
+
+    for name in _torch_fns:
+        if hasattr(torch, name):
+            _saved[name] = getattr(torch, name)
+            setattr(torch, name, _make_patched(_saved[name]))
+
+    try:
+        yield
+    finally:
+        for name, fn in _saved.items():
+            setattr(torch, name, fn)
 
 
 class FusedMoeWeightScaleSupported(Enum):
@@ -394,20 +437,54 @@ class FusedMoE(torch.nn.Module):
                 f"quant_method={type(self.quant_method).__name__})."
             )
 
-        self.quant_method.create_weights(
-            layer=self,
-            num_experts=self.num_local_experts,
-            hidden_size=hidden_size,
-            intermediate_size_per_partition=self.intermediate_size_per_partition,
-            params_dtype=params_dtype,
-            weight_loader=(
-                self.weight_loader
-                if not use_weight_loader_fused
-                else self.weight_loader_fused
-            ),
-            with_bias=with_bias,
-            moe_intermediate_size=intermediate_size,
+        _moe_dram_offload = getattr(server_args, "moe_dram_offload", False)
+        # Check if this layer should be skipped from DRAM offload.
+        # The first N MoE layers keep weights in HBM.
+        _skip_layers = getattr(server_args, "moe_dram_offload_skip_layers", 0)
+        _is_skip_layer = (
+            _moe_dram_offload and _skip_layers > 0 and layer_id < _skip_layers
         )
+        if _is_skip_layer:
+            _moe_dram_offload = False
+        self.moe_dram_offload = _moe_dram_offload
+        self._dram_offload_enabled = False
+        self._expert_weight_store = None
+        if _moe_dram_offload:
+            # Use meta device: weights are materialized layer-by-layer
+            # during load_weights_and_postprocess (see loader.py) to minimize
+            # CPU DRAM peak (pool + single layer, not pool + all non-skip
+            # layers). This avoids OOM when acc_offload pool is pre-allocated
+            # before all layers are offloaded.
+            with torch.device("meta"):
+                self.quant_method.create_weights(
+                    layer=self,
+                    num_experts=self.num_local_experts,
+                    hidden_size=hidden_size,
+                    intermediate_size_per_partition=self.intermediate_size_per_partition,
+                    params_dtype=params_dtype,
+                    weight_loader=(
+                        self.weight_loader
+                        if not use_weight_loader_fused
+                        else self.weight_loader_fused
+                    ),
+                    with_bias=with_bias,
+                    moe_intermediate_size=intermediate_size,
+                )
+        else:
+            self.quant_method.create_weights(
+                layer=self,
+                num_experts=self.num_local_experts,
+                hidden_size=hidden_size,
+                intermediate_size_per_partition=self.intermediate_size_per_partition,
+                params_dtype=params_dtype,
+                weight_loader=(
+                    self.weight_loader
+                    if not use_weight_loader_fused
+                    else self.weight_loader_fused
+                ),
+                with_bias=with_bias,
+                moe_intermediate_size=intermediate_size,
+            )
 
         self.quant_method.create_moe_runner(self, self.moe_runner_config)
         self.dispatcher = create_moe_dispatcher(self.moe_runner_config)
@@ -1411,6 +1488,16 @@ class FusedMoE(torch.nn.Module):
             from sglang.srt.hardware_backend.npu.moe.fuseep import forward_fuseep
 
             return forward_fuseep(self, hidden_states, topk_output)
+
+        # MoE DRAM offload: load ALL local experts from Host DRAM to HBM
+        # via group_pack_copy (prefill only; decode uses
+        # group_pack_copy_active_weights post-dispatch).
+        if (
+            self._dram_offload_enabled
+            and self._expert_weight_store is not None
+        ):
+            self._load_experts_on_demand(topk_output)
+
         if is_in_tc_piecewise_cuda_graph():
             if TopKOutputChecker.format_is_standard(topk_output):
                 return moe_forward_piecewise_cuda_graph_impl(
@@ -1516,6 +1603,164 @@ class FusedMoE(torch.nn.Module):
             layer=self,
             dispatch_output=dispatch_output,
         )
+
+    # ------------------------------------------------------------------
+    # MoE DRAM offload methods
+    # ------------------------------------------------------------------
+    def enable_dram_offload(self, expert_weight_store):
+        """Enable DRAM offload mode for this MoE layer.
+
+        After calling this, the forward() method will load Top-K expert
+        weights from Host DRAM to HBM before computation.
+        """
+        self._expert_weight_store = expert_weight_store
+        self._dram_offload_enabled = True
+
+    def _get_expert_weight_names(self) -> list:
+        """Get the list of weight attribute names for this MoE layer."""
+        names = []
+        for attr in ["w13_weight", "w2_weight",
+                      "w13_weight_scale", "w2_weight_scale",
+                      "w13_weight_scale_inv", "w2_weight_scale_inv",
+                      "w13_weight_scale_second", "w2_weight_scale_second",
+                      "w13_weight_offset", "w2_weight_offset",
+                      "w13_weight_offset_second", "w2_weight_offset_second",
+                      "w13_bias", "w2_bias",
+                      "w13_scale_bias", "w2_scale_bias"]:
+            if hasattr(self, attr):
+                names.append(attr)
+        return names
+
+    def offload_expert_weights_to_dram(self):
+        if self._expert_weight_store is None:
+            return
+
+        weight_names = self._get_expert_weight_names()
+        if not weight_names:
+            return
+
+        num_experts = self.num_local_experts
+
+        weights_dict = {}
+        total_hbm_bytes = 0
+        for name in weight_names:
+            param = getattr(self, name)
+            weights_dict[name] = param.data
+            total_hbm_bytes += param.data.nbytes
+
+        if torch.npu.is_available():
+            alloc_before = torch.npu.memory_allocated() / 1024**3
+        else:
+            alloc_before = 0.0
+
+        self._expert_weight_store.register_layer_batch(
+            layer_id=self.layer_id,
+            weights_dict=weights_dict,
+        )
+
+        # Free the original weight tensors; shared HBM buffers will be
+        # used instead during forward.
+        for name in weight_names:
+            if hasattr(self, name):
+                delattr(self, name)
+
+        import gc
+        gc.collect()
+        if torch.npu.is_available():
+            torch.npu.empty_cache()
+
+        # Release PyTorch CPU caching allocator memory back to the OS.
+        self._expert_weight_store._release_cpu_cache()
+
+        if torch.npu.is_available():
+            alloc_after = torch.npu.memory_allocated() / 1024**3
+        else:
+            alloc_after = 0.0
+
+        logger.info(
+            f"[FusedMoE] Layer {self.layer_id}: Offloaded {num_experts} experts "
+            f"({total_hbm_bytes / 1024**3:.2f} GB) to DRAM. "
+            f"HBM {alloc_before:.2f}->{alloc_after:.2f} GB "
+            f"(freed {alloc_before - alloc_after:.2f} GB)"
+        )
+
+    def _load_experts_on_demand(self, topk_output: TopKOutput):
+        """Load ALL local experts from DRAM into global shared HBM buffer.
+
+        Prefill-only: DeepEPMoE.forward_impl skips this in decode via the
+        _is_decode_mode guard; decode uses group_pack_copy_active_weights
+        (post-dispatch) in npu_apply_w4a8_mxfp4_moe_deepep instead.
+
+        Uses ExpertWeightStore's global shared buffers (all offloaded layers
+        share one NZ-format HBM buffer set) instead of per-layer
+        _shared_hbm_buffers. Prefill layers are processed sequentially, so
+        only one layer's weights need to be resident at a time.
+
+        The topk_output parameter is retained for API compatibility but is
+        no longer used.
+        """
+        sample_key = (self.layer_id, 0)
+        store = self._expert_weight_store
+        if sample_key not in store.dram_store:
+            return
+        weight_names = list(store.dram_store[sample_key].keys())
+
+        target_device = "npu" if torch.npu.is_available() else "cpu"
+
+        # Graph capture: skip dynamic loading. Warmup (eager mode) already
+        # ran this path and loaded weights into the global buffers; graph
+        # replay reuses those resident values.
+        if torch.npu.is_available() and torch.npu.is_current_stream_capturing():
+            if (
+                hasattr(self, "_shared_hbm_buffers")
+                and self._shared_hbm_buffers is not None
+            ):
+                for name in weight_names:
+                    setattr(self, name, self._shared_hbm_buffers[name])
+            return
+
+        # Use global shared HBM buffers from ExpertWeightStore.
+        global_buffers = store._ensure_shared_global_buffers(
+            self.layer_id, self.num_local_experts, weight_names,
+            sample_key, target_device,
+        )
+
+        # Cache global buffer ref on this layer so _release_shared_hbm_buffers
+        # can clear weight refs on prefill->decode transition.
+        self._shared_hbm_buffers = global_buffers
+
+        # Load weights from DRAM into the global HBM buffers via group_pack_copy.
+        store.group_pack_copy_to_buffers(
+            self.layer_id, weight_names, global_buffers
+        )
+
+        # Set layer weight references to the global buffers.
+        for name in weight_names:
+            setattr(self, name, global_buffers[name])
+
+    def _release_shared_hbm_buffers(self):
+        """Clear layer weight refs on prefill->decode transition.
+
+        With global shared HBM buffers (all offloaded layers reuse one set
+        of NZ-format buffers owned by ExpertWeightStore), we only clear this
+        layer's weight references to the global buffers, NOT the buffers
+        themselves. Decode's group_pack_copy_active_weights will overwrite
+        the same global buffers with compacted active experts.
+        """
+        if (
+            not getattr(self, "_dram_offload_enabled", False)
+            or not hasattr(self, "_shared_hbm_buffers")
+            or self._shared_hbm_buffers is None
+        ):
+            return
+        for name in self._shared_hbm_buffers:
+            if (
+                hasattr(self, name)
+                and getattr(self, name) is self._shared_hbm_buffers[name]
+            ):
+                setattr(self, name, None)
+        # Keep _shared_hbm_buffers ref -- it points to ExpertWeightStore's
+        # global buffers, needed for graph capture.
 
     @classmethod
     def make_expert_params_mapping(
