@@ -253,6 +253,21 @@ class DeepEPMoE(FusedMoE):
         topk_output: TopKOutput,
     ):
 
+        # MoE DRAM offload: load ALL local experts from Host DRAM to HBM.
+        # FusedMoE.forward() is bypassed in the DeepEP path, so the
+        # _load_experts_on_demand call must be replicated here.
+        # In decode mode, skip — the w4a8 DeepEP path calls
+        # group_pack_copy_active_weights which compacts active expert
+        # weights on-device post-dispatch. Calling _load_experts_on_demand
+        # here would allocate a [num_local_experts, ...] buffer and load
+        # all experts, only to be immediately overwritten.
+        if (
+            getattr(self, "_dram_offload_enabled", False)
+            and self._expert_weight_store is not None
+            and not self._expert_weight_store._is_decode_mode
+        ):
+            self._load_experts_on_demand(topk_output)
+
         if self.deprecate_flag:
             return super().forward_impl(
                 hidden_states,

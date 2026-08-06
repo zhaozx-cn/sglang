@@ -6,6 +6,7 @@
 #   - MLA output gate (mla_use_output_gate)
 #   - Full-rank KDA gate (use_full_rank_gate)
 
+import gc
 import logging
 from collections.abc import Iterable
 from functools import cached_property
@@ -2615,6 +2616,37 @@ class KimiK3LinearModel(nn.Module):
         )
         sp_sharded = False
         aux_hidden_states = []
+        is_prefill = forward_batch.forward_mode.is_prefill()
+
+        # Toggle ExpertWeightStore cache mode:
+        # - Prefill: _load_experts_on_demand loads ALL local experts into
+        #   _shared_hbm_buffers via group_pack_copy (synchronous, per-layer)
+        # - Decode: group_pack_copy_active_weights compacts active experts
+        #   on-device post-dispatch (no D2H sync)
+        # On prefill→decode transition, release _shared_hbm_buffers so the
+        # HBM is returned to the caching allocator.
+        released_any = False
+        for i in range(self.start_layer, self.end_layer):
+            layer = self.layers[i]
+            if hasattr(layer, "block_sparse_moe"):
+                experts = layer.block_sparse_moe.experts
+                if (
+                    getattr(experts, "_dram_offload_enabled", False)
+                    and experts._expert_weight_store is not None
+                ):
+                    experts._expert_weight_store.set_cache_mode(is_prefill)
+                    # Detect prefill->decode transition: only release on
+                    # the first decode forward after prefill, not every
+                    # decode forward (which would cause alloc/free churn).
+                    if not is_prefill and getattr(experts, "_last_is_prefill", False):
+                        experts._release_shared_hbm_buffers()
+                        released_any = True
+                    experts._last_is_prefill = is_prefill
+        if released_any:
+            gc.collect()
+            if torch.npu.is_available():
+                torch.npu.empty_cache()
+
         for i in range(self.start_layer, self.end_layer):
             if sp_sharded and not self.layers[i]._sp_moe:
                 hidden_states = _sp_all_gather_rows(hidden_states)

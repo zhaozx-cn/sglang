@@ -2982,6 +2982,38 @@ class ServerArgs:
     offload_mode: A[str, "Mode of offloading.", NS("exec.offload")] = "cpu"
 
     # -------------------------------------------------------------------------
+    # MoE DRAM Offload
+    # -------------------------------------------------------------------------
+    moe_dram_offload: A[
+        bool,
+        "Offload MoE expert weights to Host DRAM. Only Top-K selected "
+        "experts are loaded to HBM on demand during forward.",
+    ] = False
+    moe_dram_offload_skip_layers: A[
+        int,
+        "Number of first MoE layers to keep in HBM (not offloaded to "
+        "Host DRAM). Their weights are allocated on HBM directly and "
+        "used without on-demand loading. Reduces Host DRAM requirement "
+        "at the cost of HBM. 0 = offload all layers (default).",
+    ] = 0
+    moe_dram_acc_offload_layers: A[
+        int,
+        "Number of offloaded MoE layers (starting from skip_layers) to "
+        "store in acc_offload DRAM pool. Remaining offloaded layers use "
+        "PyTorch H2D (torch.empty). Use when 8 ranks × full pool size "
+        "exceeds physical DRAM. 0 = all offloaded layers use acc_offload "
+        "(default). Example: skip_layers=15, acc_offload_layers=60 → "
+        "layers 0-14 in HBM, layers 15-74 in acc_offload pool, layers "
+        "75+ in PyTorch H2D.",
+    ] = 0
+    moe_use_acc_offload: A[
+        bool,
+        "Use MemFabric acc_offload (AICore AIV kernel with MTE engine) "
+        "for batch sparse copy from DRAM to HBM. Falls back to PyTorch "
+        "H2D if memfabric_hybrid is not available. Defaults to True.",
+    ] = True
+
+    # -------------------------------------------------------------------------
     # LMCache
     # -------------------------------------------------------------------------
     enable_lmcache: A[
