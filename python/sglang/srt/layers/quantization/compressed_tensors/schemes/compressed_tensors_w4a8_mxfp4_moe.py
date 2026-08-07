@@ -670,14 +670,6 @@ def w4a8_mxfp4_gmm_npu(
         if weight_scale.is_contiguous():
             weight_scale = weight_scale.transpose(-3, -2)
 
-    if logger.isEnabledFor(logging.WARNING):
-        logger.warning(
-            f"[w4a8_mxfp4_gmm_npu] group_list.shape={group_list.shape} "
-            f"weight.shape={weight.shape} is_nz_stored={is_nz_stored} "
-            f"is_nd_format={is_nd_format} group_list_type={group_list_type} "
-            f"capturing={torch.npu.is_current_stream_capturing()}"
-        )
-
     return torch.ops.npu.npu_grouped_matmul(
         [x],
         [weight],

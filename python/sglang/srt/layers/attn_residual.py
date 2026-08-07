@@ -272,8 +272,15 @@ def _aggregate_fused(
     out_norm: RMSNorm,
 ) -> torch.Tensor:
     # Step 3: standard RMSNorm (sglang's optimized kernel)
-    return out_norm(_mix_fused(prefix_sum, bank, nvb, score_proj, score_norm))
-
+    if torch.distributed.get_rank() == 0:
+        print(f"***********************_aggregate_fused _mix_fused input ",prefix_sum[:,:10]," shape ",prefix_sum.shape,flush=True)
+    mixed = _mix_fused(prefix_sum, bank, nvb, score_proj, score_norm)
+    if torch.distributed.get_rank() == 0:
+        print(f"***********************_aggregate_fused _mix_fused ",mixed[:,:10]," shape ",mixed.shape,flush=True)
+    out = out_norm(mixed)
+    if torch.distributed.get_rank() == 0:
+        print(f"***********************_aggregate_fused norm out ",out[:,:10]," shape ",out.shape,flush=True)
+    return out
 
 def _aggregate_hip(
     prefix_sum: torch.Tensor,

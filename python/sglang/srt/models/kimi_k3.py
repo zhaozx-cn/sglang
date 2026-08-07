@@ -417,7 +417,7 @@ class KimiK3MoE(nn.Module):
         # For MXFP4 compressed-tensors, replace quant_config with Mxfp4Config
         # so FusedMoE's weight_loader uses the MXFP4 fast path
         moe_quant_config = quant_config
-        if quant_config is not None and getattr(quant_config, "quant_format", None):
+        if quant_config is not None and getattr(quant_config, "quant_format", None) and not get_bool_env_var("SGLANG_W4A8_MXFP4_MOE"):
             if "mxfp4" in quant_config.quant_format:
                 from sglang.srt.layers.quantization.mxfp4 import Mxfp4Config
 
@@ -1046,6 +1046,8 @@ class KimiK3MoE(nn.Module):
             if self._use_mega_moe
             else self.experts(routed_input, topk_output)
         )
+        if torch.distributed.get_rank() == 0:
+            print(f"***********************layer {self.layer_idx} in moe before norm routed_expert ",expert_output[:,:10]," shape ",expert_output.shape,flush=True)
         if expert_output.shape[0] == 0:
             # The EP combine returns one row per source token.  Keep the
             # source-side empty result while avoiding empty RMSNorm/up-proj
@@ -1068,6 +1070,9 @@ class KimiK3MoE(nn.Module):
                 and not self._shared_experts_attn_tp_comm
             ):
                 shared_output = tensor_model_parallel_all_reduce(shared_output)
+            if torch.distributed.get_rank() == 0:
+                print(f"***********************layer {self.layer_idx} after moe routed_expert ",out[:,:10]," shape ",out.shape,flush=True)
+                print(f"***********************layer {self.layer_idx} after moe shared_output ",shared_output[:,:10]," shape ",shared_output.shape,flush=True)
             out = _add3(out, shared_output, prefix_sum)
             return out
         out = out if prefix_sum is None else out + prefix_sum
@@ -1284,7 +1289,6 @@ class KimiK3MoE(nn.Module):
         if not fused_norm:
             latent = self._latent_norm(latent)
         out, _ = self.routed_expert_up_proj(latent)
-
         # prefetch_bc: b (shared_output) was produced by the all-reduce and
         # c (prefix_sum) even earlier; the AR is a plain launch (full
         # barrier), so both are complete once the norm / up_proj GEMM chain
@@ -1831,6 +1835,8 @@ class KimiK3DeltaAttention(nn.Module):
             out = _k3_symm_o_proj_out(self.o_proj, core_attn_out)
             partial, _ = self.o_proj(core_attn_out, output_tensor=out)
             return partial
+        if torch.distributed.get_rank() == 0:
+            print(f"***********************layer {self.layer_idx} core_attn_out ",core_attn_out[:,:10]," shape ",core_attn_out.shape,flush=True)
         return self.o_proj(core_attn_out)[0]
 
 
@@ -2388,6 +2394,8 @@ class KimiK3DecoderLayer(nn.Module):
                 # gather the normalized tensor consumed by attention.
                 hidden_states = _sp_all_gather_rows(hidden_states)
         else:
+            if torch.distributed.get_rank() == 0:
+                print(f"***********************layer {self.layer_idx} before attn_res hidden_states ",hidden_states[:,:10]," shape ",hidden_states.shape,flush=True)
             hidden_states, prefix_sum = attn_res.forward(
                 hidden_states,
                 prefix_sum,
@@ -2398,7 +2406,8 @@ class KimiK3DecoderLayer(nn.Module):
             )
         if self.is_block_write_layer:
             prefix_sum = None
-
+        if torch.distributed.get_rank() == 0:
+            print(f"***********************layer {self.layer_idx} before attn hidden_states ",hidden_states[:,:10]," shape ",hidden_states.shape,flush=True)
         # ---- Attention ----
         hidden_states = self._run_self_attn(
             hidden_states, positions, forward_batch, zero_allocator
@@ -2469,15 +2478,21 @@ class KimiK3DecoderLayer(nn.Module):
                 rows=rows,
             )
 
+        if torch.distributed.get_rank() == 0:
+            print(f"***********************layer {self.layer_idx} before moe hidden_states ",hidden_states[:,:10]," shape ",hidden_states.shape,flush=True)
         # ---- MLP (consumes +prefix_sum: MoE folds it into the 3-way tail
         # add, dense adds it after down_proj) ----
         out = self.mlp(
             hidden_states, prefix_sum=prefix_sum, forward_batch=forward_batch
         )
+        if torch.distributed.get_rank() == 0:
+            print(f"***********************layer {self.layer_idx} after moe out ",out[:,:10]," shape ",out.shape,flush=True)
         if shard_lo >= 0:
             if keep_sharded:
                 return out, None, True
             out = _sp_all_gather_rows(out)
+        if torch.distributed.get_rank() == 0:
+            print(f"***********************layer {self.layer_idx} end out ",out[:,:10]," shape ",out.shape,flush=True)
         return out, None, False
 
 
@@ -2517,7 +2532,7 @@ class KimiK3LinearModel(nn.Module):
         # (The attn-res bank write no longer needs a stream: it is fused
         # into the agg1 fast kernel, see AttnResidual.forward(write=True).)
         # Disable on HIP code path.
-        self.alt_streams = None if _is_hip else [torch.cuda.Stream() for _ in range(3)]
+        self.alt_streams = None# if _is_hip else [torch.cuda.Stream() for _ in range(3)]
 
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
@@ -2930,7 +2945,7 @@ class KimiK3LinearForCausalLM(nn.Module):
                     continue
 
             # compressed-tensors MXFP4 stores as weight_packed; Mxfp4MoEMethod uses weight
-            if "weight_packed" in name:
+            if "weight_packed" in name and not get_bool_env_var("SGLANG_W4A8_MXFP4_MOE"):
                 name = name.replace("weight_packed", "weight")
 
             # MLA: fuse q_a_proj + kv_a_proj_with_mqa → fused_qkv_a_proj_with_mqa

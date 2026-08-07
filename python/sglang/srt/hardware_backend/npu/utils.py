@@ -24,7 +24,13 @@ import triton.language.extra.cann.libdevice as libdevice
 
 from sgl_kernel_npu.utils.triton_utils import get_device_properties
 
-
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_H": b, "multibuffer": True})
+        for b in (1024, 2048, 4096, 8192)
+    ],
+    key=["HALF_COLS", "HAS_GROUP_LIST"],
+)
 @triton.jit
 def _situ_and_mul_kernel(
     x_ptr,

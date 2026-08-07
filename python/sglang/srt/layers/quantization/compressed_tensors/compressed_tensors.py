@@ -70,6 +70,7 @@ from sglang.srt.layers.quantization.unquant import (
     UnquantizedLinearMethod,
 )
 from sglang.srt.utils import is_cuda, is_hip, is_npu
+from sglang.srt.utils.common import get_bool_env_var
 
 _is_cuda = is_cuda()
 _is_npu = is_npu()
@@ -183,7 +184,7 @@ class CompressedTensorsConfig(QuantizationConfig):
             # Detect MXFP4 before the scheme-based path: MXFP4 uses a
             # dedicated FusedMoEMethodBase (Mxfp4MoEMethod) that already
             # handles all MoE backends, bypassing the scheme abstraction.
-            if self._is_mxfp4_moe(layer_name=prefix):
+            if self._is_mxfp4_moe(layer_name=prefix) and not get_bool_env_var("SGLANG_W4A8_MXFP4_MOE"):
                 from sglang.srt.layers.quantization.mxfp4 import Mxfp4MoEMethod
 
                 logger.info_once(
