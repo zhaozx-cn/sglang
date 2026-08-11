@@ -1419,6 +1419,10 @@ class DefaultModelLoader(BaseModelLoader):
             f"(acc_offload pool + {h2d_count} H2D tail layers)"
         )
 
+        for _, module in model.named_modules():
+            if hasattr(module, "_attn_res_cw_cache"):
+                delattr(module, "_attn_res_cw_cache")
+
 
 class LayeredModelLoader(DefaultModelLoader):
     """Model loader that loads weights layer by layer so that one can quantize a
