@@ -1731,23 +1731,6 @@ class FusedMoE(torch.nn.Module):
 
         target_device = "npu" if torch.npu.is_available() else "cpu"
 
-        # Graph capture: skip dynamic loading. Warmup (eager mode) already
-        # ran this path and loaded weights into the global buffers; graph
-        # replay reuses those resident values. Loading during capture
-        # would allocate new tensors whose addresses differ from the
-        # captured graph, causing silent data corruption.
-        if torch.npu.is_available() and torch.npu.is_current_stream_capturing():
-            # Global buffers were populated during warmup. Just set layer
-            # refs to the buffer dict (stored in _shared_hbm_buffers during
-            # warmup's first call).
-            if (
-                hasattr(self, "_shared_hbm_buffers")
-                and self._shared_hbm_buffers is not None
-            ):
-                for name in weight_names:
-                    setattr(self, name, self._shared_hbm_buffers[name])
-            return
-
         # Use global shared HBM buffers from ExpertWeightStore.
         # Pre-allocated once (NZ format) on first call; reused across all
         # offloaded layers.
