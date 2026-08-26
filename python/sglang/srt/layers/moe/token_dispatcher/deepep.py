@@ -4,7 +4,7 @@ import logging
 import os
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple, Union
+from typing import TYPE_CHECKING, NamedTuple, Optional, Tuple, Union
 
 from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.environ import envs
@@ -113,7 +113,7 @@ class DeepEPNormalDispatchOutput(NamedTuple):
     hidden_states_scale: Optional[torch.Tensor]
     topk_ids: torch.Tensor
     topk_weights: torch.Tensor
-    num_recv_tokens_per_expert: List[int]
+    num_recv_tokens_per_expert: torch.Tensor
 
     @property
     def format(self) -> DispatchOutputFormat:

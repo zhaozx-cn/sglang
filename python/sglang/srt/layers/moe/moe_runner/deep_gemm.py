@@ -1097,11 +1097,18 @@ def pre_permute_deepep_normal_to_deep_gemm(
         hidden_states_scale,
         topk_ids,
         topk_weights,
-        num_recv_tokens_per_expert,
+        recv_tokens_per_expert,
     ) = dispatch_output
     assert runner_config.activation in ("silu", "situ")
 
-    all_tokens = sum(num_recv_tokens_per_expert)
+    if isinstance(recv_tokens_per_expert, list):
+        # Internode dispatch still returns a Python list.
+        all_tokens = sum(recv_tokens_per_expert)
+    else:
+        # Intranode dispatch returns a device tensor ([round, num_local_experts],
+        # round-major); the total number of received tokens is the sum over all
+        # elements.
+        all_tokens = int(recv_tokens_per_expert.sum())
     running_state["all_tokens"] = all_tokens
 
     K = hidden_states.shape[1]
@@ -1145,17 +1152,22 @@ def pre_permute_deepep_normal_to_deep_gemm(
     m_indices = buffer_init(all_tokens, device=hidden_states.device, dtype=torch.int32)
     output_index = torch.empty_like(topk_ids)
 
-    if get_offloader().forbid_copy_engine_usage:
-        num_recv_tokens_per_expert_gpu = copy_list_to_gpu_no_ce(
-            num_recv_tokens_per_expert
-        )
+    if isinstance(recv_tokens_per_expert, list):
+        if get_offloader().forbid_copy_engine_usage:
+            num_recv_tokens_per_expert_gpu = copy_list_to_gpu_no_ce(
+                recv_tokens_per_expert
+            )
+        else:
+            num_recv_tokens_per_expert_gpu = torch.tensor(
+                recv_tokens_per_expert,
+                dtype=torch.int32,
+                pin_memory=True,
+                device="cpu",
+            ).cuda(non_blocking=True)
     else:
-        num_recv_tokens_per_expert_gpu = torch.tensor(
-            num_recv_tokens_per_expert,
-            dtype=torch.int32,
-            pin_memory=True,
-            device="cpu",
-        ).cuda(non_blocking=True)
+        num_recv_tokens_per_expert_gpu = recv_tokens_per_expert.sum(dim=0).to(
+            torch.int32
+        )
     expert_start_loc = torch.empty_like(num_recv_tokens_per_expert_gpu)
 
     ep_scatter(

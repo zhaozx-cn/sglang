@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -262,13 +263,26 @@ def pre_permute_deepep_normal_to_ascend(
         hidden_states_scale,
         topk_ids,
         topk_weights,
-        num_recv_tokens_per_expert,
+        recv_tokens_per_expert,
     ) = dispatch_output
-    group_list = torch.tensor(
-        num_recv_tokens_per_expert,
-        dtype=torch.int64,
-        device=hidden_states.device,
-    )
+
+    if isinstance(recv_tokens_per_expert, list):
+        # Internode dispatch still returns a Python list.
+        group_list = torch.tensor(
+            recv_tokens_per_expert,
+            dtype=torch.int64,
+            device=hidden_states.device,
+        )
+    else:
+        from sgl_kernel_npu.moe.recv_tokens_group_list import recv_tokens_to_group_list
+
+        # intranode_dispatch returns the raw per-round received-token counts as a
+        # device tensor ([round, num_local_experts], round-major); parse the
+        # per-expert group_list on device to avoid a host D2H/H2D round-trip.
+        expert_token_nums_type = int(os.getenv("MOE_EXPERT_TOKEN_NUMS_TYPE", "1"))
+        group_list = recv_tokens_to_group_list(
+            recv_tokens_per_expert, expert_token_nums_type
+        )
     running_state["topk_ids"] = topk_ids
     running_state["topk_weights"] = topk_weights
 

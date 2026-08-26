@@ -32,6 +32,7 @@ from typing import (
     Sequence,
     Tuple,
     Type,
+    Union,
 )
 
 import einops
@@ -117,7 +118,7 @@ class ExpertDistributionRecorder(ABC):
 
     def on_deepep_dispatch_normal(
         self,
-        local_physical_count_of_layer: List[int],
+        local_physical_count_of_layer: Union[List[int], torch.Tensor],
         num_tokens_per_rank,
         num_tokens_per_rdma_rank,
         num_tokens_per_expert,
@@ -229,7 +230,7 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
 
     def on_deepep_dispatch_normal(
         self,
-        local_physical_count_of_layer: List[int],
+        local_physical_count_of_layer: Union[List[int], torch.Tensor],
         num_tokens_per_rank,
         num_tokens_per_rdma_rank,
         num_tokens_per_expert,
@@ -373,7 +374,7 @@ class _SinglePassGatherer(ABC):
     def on_deepep_dispatch_normal(
         self,
         layer_idx: int,
-        local_physical_count_of_layer: List[int],
+        local_physical_count_of_layer: Union[List[int], torch.Tensor],
         num_tokens_per_rank,
         num_tokens_per_rdma_rank,
         num_tokens_per_expert,
@@ -439,7 +440,7 @@ class _DetailSinglePassGatherer(_SinglePassGatherer):
     def on_deepep_dispatch_normal(
         self,
         layer_idx: int,
-        local_physical_count_of_layer: List[int],
+        local_physical_count_of_layer: Union[List[int], torch.Tensor],
         num_tokens_per_rank,
         num_tokens_per_rdma_rank,
         num_tokens_per_expert,
@@ -572,12 +573,18 @@ class _DeepepNormalSinglePassGatherer(_LayerBasedCpuSinglePassGatherer):
     def on_deepep_dispatch_normal(
         self,
         layer_idx: int,
-        local_physical_count_of_layer: List[int],
+        local_physical_count_of_layer: Union[List[int], torch.Tensor],
         num_tokens_per_rank,
         num_tokens_per_rdma_rank,
         num_tokens_per_expert,
     ):
-        assert isinstance(local_physical_count_of_layer, list)
+        assert isinstance(local_physical_count_of_layer, (list, torch.Tensor))
+        if isinstance(local_physical_count_of_layer, torch.Tensor):
+            # intranode_dispatch returns a device tensor ([round, num_local_experts]);
+            # reduce over rounds to per-expert counts before accumulating.
+            local_physical_count_of_layer = local_physical_count_of_layer.sum(
+                dim=0
+            ).tolist()
         self._on_layer_data(layer_idx, local_physical_count_of_layer)
 
     def collect(self) -> Dict:
