@@ -1327,8 +1327,13 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             indices,
                             src_data_ptrs,
                             src_item_lens,
+                            src_dim_per_tensor,
                             dst_data_ptrs,
+                            dst_item_lens,
+                            dst_dim_per_tensor,
                             dst_indices,
+                            src_conv_shard_groups,
+                            src_slice_outer_counts,
                             src_state_layer_ids,
                             dst_state_layer_ids,
                         )
@@ -1425,8 +1430,13 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         prefill_mamba_index: list,
         src_state_data_ptrs: list[int],
         src_state_item_lens: list[int],
+        src_state_dim_per_tensor: list[int],
         dst_state_data_ptrs: list[int],
+        dst_state_item_lens: list[int],
+        dst_state_dim_per_tensor: list[int],
         dst_mamba_index: list,
+        src_state_conv_shard_groups: list = None,
+        src_state_slice_outer_counts: list[int] = None,
         src_layer_ids: Optional[List[int]] = None,
         dst_layer_ids: Optional[List[int]] = None,
     ):
@@ -1442,10 +1452,56 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         )
         for i, j in pairs:
             dst_state_ptr = dst_state_data_ptrs[j]
-            length = src_state_item_lens[i]
-            src_addr = src_state_data_ptrs[i] + length * int(prefill_mamba_index[0])
-            dst_addr = dst_state_ptr + length * int(dst_mamba_index[0])
-            transfer_blocks.append((src_addr, dst_addr, length))
+            src_item_len = src_state_item_lens[i]
+            dst_item_len = dst_state_item_lens[j]
+            src_dim = (
+                src_state_dim_per_tensor[i] if i < len(src_state_dim_per_tensor) else 0
+            )
+            dst_dim = (
+                dst_state_dim_per_tensor[j] if j < len(dst_state_dim_per_tensor) else 0
+            )
+            src_addr = src_state_data_ptrs[i] + src_item_len * int(
+                prefill_mamba_index[0]
+            )
+            dst_addr = dst_state_ptr + dst_item_len * int(dst_mamba_index[0])
+
+            conv_shard_groups = (
+                src_state_conv_shard_groups[i]
+                if src_state_conv_shard_groups and i < len(src_state_conv_shard_groups)
+                else None
+            )
+            src_outer_count = (
+                src_state_slice_outer_counts[i]
+                if src_state_slice_outer_counts
+                and i < len(src_state_slice_outer_counts)
+                else 1
+            )
+            if src_item_len != dst_item_len:
+                # Ascend KDA speculative decode expands the conv window from
+                # K - 1 == 3 rows to 10 rows. Its kernels consume the last
+                # three rows, so use Decode's slot stride and tail-align them.
+                is_kda_3_to_10 = (
+                    src_outer_count == 3
+                    and src_dim > 0
+                    and src_dim == dst_dim
+                    and conv_shard_groups is not None
+                    and len(conv_shard_groups) == 3
+                    and all(group > 0 for group in conv_shard_groups)
+                    and sum(conv_shard_groups) == src_dim * self.attn_tp_size
+                    and src_item_len % (3 * src_dim) == 0
+                    and dst_item_len % (10 * dst_dim) == 0
+                    and src_item_len // (3 * src_dim) == dst_item_len // (10 * dst_dim)
+                )
+                if not is_kda_3_to_10:
+                    raise RuntimeError(
+                        "Mamba state item lengths differ outside the supported "
+                        "Ascend KDA 3-to-10 conv-window layout: "
+                        f"src_item_len={src_item_len}, dst_item_len={dst_item_len}, "
+                        f"src_dim={src_dim}, dst_dim={dst_dim}, "
+                        f"src_outer_count={src_outer_count}."
+                    )
+                dst_addr += dst_item_len - src_item_len
+            transfer_blocks.append((src_addr, dst_addr, src_item_len))
 
         return self._transfer_data(req.mooncake_session_id, transfer_blocks)
 
@@ -1493,8 +1549,13 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 prefill_mamba_index,
                 src_state_data_ptrs,
                 src_state_item_lens,
+                src_state_dim_per_tensor,
                 dst_state_data_ptrs,
+                dst_state_item_lens,
+                dst_state_dim_per_tensor,
                 dst_mamba_index,
+                src_state_conv_shard_groups,
+                src_state_slice_outer_counts,
                 src_layer_ids,
                 dst_layer_ids,
             )
