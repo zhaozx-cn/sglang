@@ -1543,9 +1543,12 @@ class Envs:
     # srt/layers/k3_sp_collective.py.
     SGLANG_K3_SP_COLLECTIVE = EnvBool(False)
     # Keep K3's post-MoE residual stream token-sharded between consecutive
-    # SP-MoE layers. The next attention-residual aggregation and snapshot
-    # bank write run on the local shard, then only the normalized attention
-    # input is all-gathered. Requires SGLANG_K3_SP_COLLECTIVE.
+    # SP-MoE layers. The embedding reduce-scatters (instead of all-reducing)
+    # into the initial shard; each attention-residual aggregation and snapshot
+    # bank write runs on the local shard, then only the normalized attention
+    # input is all-gathered, and the o_proj output is reduce-scattered back.
+    # The tuned k3_sp_collective kernels (SGLANG_K3_SP_COLLECTIVE) engage
+    # opportunistically; other platforms use generic attention-TP collectives.
     SGLANG_K3_SP_ATTN_RES = EnvBool(False)
     # Fused o_proj GEMM + all-reduce (bf16, TP 2..8, SM100+): one
     # kernel computes the TP-local o_proj partial and the cross-rank sum over

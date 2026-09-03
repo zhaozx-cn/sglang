@@ -282,6 +282,24 @@ def _sp_local_rows(hidden_states: torch.Tensor) -> slice:
     return slice(lo, lo + hidden_states.shape[0])
 
 
+def _sp_moe_a2a_backend_enabled() -> bool:
+    """Whether the EP a2a backend lets the MoE region consume a token shard.
+
+    These backends (megamoe / DeepEP / Mooncake / Ascend-FuseEP / MoRI) move
+    each row to its experts directly, so a rank holding only its 1/attn_tp
+    token shard dispatches every global token exactly once — the precondition
+    for both the decoder-layer SP-MoE path and the SP embedding reduce-scatter.
+    """
+    _a2a_backend = get_moe_a2a_backend()
+    return (
+        _a2a_backend.is_megamoe()
+        or _a2a_backend.is_deepep()
+        or _a2a_backend.is_mooncake()
+        or _a2a_backend.is_ascend_fuseep()
+        or _a2a_backend.is_mori()
+    )
+
+
 class KimiK3MLP(nn.Module):
     """K3 MLP; SiLU or SiTU activation."""
 
@@ -2219,15 +2237,8 @@ class KimiK3DecoderLayer(nn.Module):
         # removes the replication. Dense layers are excluded: their
         # column-parallel MLP has no per-token decomposition that survives a
         # token shard.
-        _a2a_backend = get_moe_a2a_backend()
         self._sp_moe = (
-            (
-                _a2a_backend.is_megamoe()
-                or _a2a_backend.is_deepep()
-                or _a2a_backend.is_mooncake()
-                or _a2a_backend.is_ascend_fuseep()
-                or _a2a_backend.is_mori()
-            )
+            _sp_moe_a2a_backend_enabled()
             and self._is_moe_layer
             and get_parallel().attn_tp_group.world_size > 1
         )
@@ -2681,6 +2692,24 @@ class KimiK3LinearModel(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
 
+        # SP embedding (the head of the SP attention-residual carry): the
+        # embedding reduce-scatters instead of all-reducing, so the decoder
+        # stack starts from this rank's 1/attn_tp token shard. Each layer then
+        # aggregates the attention residual and applies input_layernorm on the
+        # shard, all-gathers right before attention, and reduce-scatters the
+        # o_proj output back — the attn-res/norm compute drops to 1/attn_tp.
+        # Requires the SP-MoE layer path to consume the shard; DSPARK capture
+        # and PP transfers need full tensors and fall back (see forward).
+        self._sp_embed = (
+            self.pp_group.world_size == 1
+            and config.attn_res_block_size is not None
+            and envs.SGLANG_K3_SP_ATTN_RES.get()
+            and get_parallel().attn_tp_group.world_size > 1
+            and _sp_moe_a2a_backend_enabled()
+        )
+        if self._sp_embed:
+            self.embed_tokens.sp_output_sharded = True
+
         # Multi-stream pool (deepseek_v4 pattern): every alt stream is
         # constructed here and threaded down to the layers. Slots:
         #   [0] MoE dual-stream shared-expert tail
@@ -2773,20 +2802,31 @@ class KimiK3LinearModel(nn.Module):
                 hidden_states,
                 attn_res_block_num,
                 block_residual=residual,
+                # Under SP the embedding hands over a token shard, but the
+                # snapshot bank spans the full batch.
+                num_tokens=positions.shape[0] if self._sp_embed else None,
             )
             residual = None
 
         # Carry the raw residual stream as a token shard across consecutive
         # SP-MoE layers. PP transfer and dspark capture require full tensors,
         # so those uncommon paths keep the established gather-per-layer flow.
-        sp_attn_res = (
-            attn_res is not None
-            and envs.SGLANG_K3_SP_ATTN_RES.get()
-            and self.pp_group.world_size == 1
-            and self.dspark_layers_to_capture is None
-            and k3_sp_collective.enabled()
-        )
+        # The tuned k3_sp_collective kernels engage opportunistically where
+        # available; other platforms carry the shard through the generic
+        # attention-TP reduce-scatter / all-gather fallbacks.
+        sp_attn_res = self._sp_embed and self.dspark_layers_to_capture is None
+        # The embedding hands over a token shard unless the batch was not
+        # divisible by attn_tp (all-reduce fallback inside the embedding) or
+        # the carry is disabled for this pass — then the stack runs on the
+        # full batch exactly as without the SP embedding.
         sp_sharded = False
+        if self._sp_embed:
+            group = get_parallel().attn_tp_group
+            if hidden_states.shape[0] * group.world_size == positions.shape[0]:
+                if sp_attn_res:
+                    sp_sharded = True
+                else:
+                    hidden_states = _sp_all_gather_rows(hidden_states)
         aux_hidden_states = []
         for i in range(self.start_layer, self.end_layer):
             if sp_sharded and not self.layers[i]._sp_moe:

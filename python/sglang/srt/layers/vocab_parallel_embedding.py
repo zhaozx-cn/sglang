@@ -247,6 +247,12 @@ class VocabParallelEmbedding(torch.nn.Module):
 
         self.enable_tp = enable_tp
         self.use_attn_tp_group = use_attn_tp_group
+        # SP embedding: when True, forward() reduce-scatters the vocab-shard
+        # partial sums instead of all-reducing, so each rank keeps only its
+        # 1/tp_size token shard (the decoder layers all-gather right before
+        # attention). Set by SP models (Kimi K3); requires the model stack to
+        # consume sharded rows.
+        self.sp_output_sharded = False
         if self.enable_tp:
             if use_attn_tp_group:
                 tp_rank = get_parallel().attn_tp_rank
@@ -563,6 +569,28 @@ class VocabParallelEmbedding(torch.nn.Module):
         output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
         return output_parallel
 
+    def _sp_reduce_scatter_output(
+        self, output_parallel: torch.Tensor
+    ) -> Optional[torch.Tensor]:
+        """Reduce-scatter the vocab-shard partial sums into this rank's token
+        shard (SP embedding). Returns None when the row count is not divisible
+        by the group size — the caller then falls back to the full all-reduce
+        and the layers run on the whole batch (same fallback contract as the
+        SP-MoE reduce in KimiK3DecoderLayer._finish_attn_reduce)."""
+        group = (
+            get_parallel().attn_tp_group if self.use_attn_tp_group else get_tp_group()
+        )
+        num_tokens, hidden_size = output_parallel.shape
+        if num_tokens <= 0 or num_tokens % group.world_size != 0:
+            return None
+        output = torch.empty(
+            (num_tokens // group.world_size, hidden_size),
+            dtype=output_parallel.dtype,
+            device=output_parallel.device,
+        )
+        group.reduce_scatter_tensor(output, output_parallel)
+        return output
+
     def forward(self, input_):
         # Surface a bad token id (>= vocab_size, or a negative / unmasked sentinel) as a
         # located async assert instead of a silent OOB embedding gather (tp=1 does not mask).
@@ -571,6 +599,10 @@ class VocabParallelEmbedding(torch.nn.Module):
         )
         output_parallel = self._embed_local_shard(input_)
         if self.tp_size > 1 and not get_attn_tp_context().input_scattered:
+            if self.sp_output_sharded:
+                sp_output = self._sp_reduce_scatter_output(output_parallel)
+                if sp_output is not None:
+                    return sp_output
             if self.use_attn_tp_group:
                 output_parallel = attn_tp_all_reduce(output_parallel)
             else:
