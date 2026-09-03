@@ -580,7 +580,7 @@ class VocabParallelEmbedding(torch.nn.Module):
         group = (
             get_parallel().attn_tp_group if self.use_attn_tp_group else get_tp_group()
         )
-        num_tokens, hidden_size = output_parallel.shape
+        num_tokens, hidden_size = output_parallel.squeeze().shape
         if num_tokens <= 0 or num_tokens % group.world_size != 0:
             return None
         output = torch.empty(
