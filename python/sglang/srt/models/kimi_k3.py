@@ -275,6 +275,23 @@ def _sp_all_gather_rows(hidden_states: torch.Tensor) -> torch.Tensor:
     return full
 
 
+def _sp_all_gather_bank(bank: torch.Tensor) -> torch.Tensor:
+    """Reassemble the full snapshot bank from each rank's valid row slice.
+
+    Under the SP carry the bank is allocated full-size but only this rank's
+    token slice was written; DSPARK capture consumes per-row mixtures over
+    every row, so the slices are gathered back (rank order matches
+    _sp_local_rows). Only at capture layers — the bank is NBx the hidden
+    states, too expensive to materialize per layer.
+    """
+    group = get_parallel().attn_tp_group
+    shard = bank.shape[0] // group.world_size
+    rows = slice(group.rank_in_group * shard, (group.rank_in_group + 1) * shard)
+    out = torch.empty_like(bank)
+    group.all_gather_into_tensor(out, bank[rows].contiguous())
+    return out
+
+
 def _sp_local_rows(hidden_states: torch.Tensor) -> slice:
     """Full-batch row interval owned by this rank's contiguous token shard."""
     group = get_parallel().attn_tp_group
@@ -2698,8 +2715,10 @@ class KimiK3LinearModel(nn.Module):
         # aggregates the attention residual and applies input_layernorm on the
         # shard, all-gathers right before attention, and reduce-scatters the
         # o_proj output back — the attn-res/norm compute drops to 1/attn_tp.
-        # Requires the SP-MoE layer path to consume the shard; DSPARK capture
-        # and PP transfers need full tensors and fall back (see forward).
+        # Requires the SP-MoE layer path to consume the shard. DSPARK capture
+        # stays compatible: it reassembles the full stream and snapshot bank
+        # at its capture layers. PP transfers need full tensors and keep the
+        # gather-per-layer flow (see forward).
         self._sp_embed = (
             self.pp_group.world_size == 1
             and config.attn_res_block_size is not None
@@ -2809,25 +2828,28 @@ class KimiK3LinearModel(nn.Module):
             residual = None
 
         # Carry the raw residual stream as a token shard across consecutive
-        # SP-MoE layers. PP transfer and dspark capture require full tensors,
-        # so those uncommon paths keep the established gather-per-layer flow.
-        # The tuned k3_sp_collective kernels engage opportunistically where
-        # available; other platforms carry the shard through the generic
-        # attention-TP reduce-scatter / all-gather fallbacks.
-        sp_attn_res = self._sp_embed and self.dspark_layers_to_capture is None
+        # SP-MoE layers. PP transfer requires full tensors, so that path keeps
+        # the established gather-per-layer flow; DSPARK capture stays on the
+        # carry and reassembles the full stream + snapshot bank at its capture
+        # layers (_dspark_capture_stream). The tuned k3_sp_collective kernels
+        # engage opportunistically where available; other platforms carry the
+        # shard through the generic attention-TP reduce-scatter / all-gather
+        # fallbacks.
+        sp_attn_res = self._sp_embed
         # The embedding hands over a token shard unless the batch was not
-        # divisible by attn_tp (all-reduce fallback inside the embedding) or
-        # the carry is disabled for this pass — then the stack runs on the
-        # full batch exactly as without the SP embedding.
+        # divisible by attn_tp (all-reduce fallback inside the embedding) —
+        # then the stack runs on the full batch exactly as without the SP
+        # embedding.
         sp_sharded = False
         if self._sp_embed:
             group = get_parallel().attn_tp_group
-            if hidden_states.shape[0] * group.world_size == positions.shape[0]:
-                if sp_attn_res:
-                    sp_sharded = True
-                else:
-                    hidden_states = _sp_all_gather_rows(hidden_states)
+            sp_sharded = hidden_states.shape[0] * group.world_size == positions.shape[0]
         aux_hidden_states = []
+        # Whether bank rows written so far are rank-local (any SP-sharded
+        # layer): a dense layer ends the carry and restores full-batch
+        # hidden states, but the early bank rows stay rows-scoped and every
+        # later DSPARK capture must still gather the bank.
+        bank_sharded = False
         for i in range(self.start_layer, self.end_layer):
             if sp_sharded and not self.layers[i]._sp_moe:
                 hidden_states = _sp_all_gather_rows(hidden_states)
@@ -2843,12 +2865,20 @@ class KimiK3LinearModel(nn.Module):
                     input_sharded=sp_sharded,
                     keep_sharded=sp_attn_res,
                 )
+            bank_sharded = bank_sharded or sp_sharded
             if (
                 self.dspark_layers_to_capture is not None
                 and i in self.dspark_layers_to_capture
             ):
                 aux_hidden_states.append(
-                    self._dspark_capture_stream(i, hidden_states, residual, attn_res)
+                    self._dspark_capture_stream(
+                        i,
+                        hidden_states,
+                        residual,
+                        attn_res,
+                        sharded=sp_sharded,
+                        bank_sharded=bank_sharded,
+                    )
                 )
 
         if not self.pp_group.is_last_rank:
@@ -2912,15 +2942,31 @@ class KimiK3LinearModel(nn.Module):
         hidden_states: torch.Tensor,
         residual: Optional[torch.Tensor],
         attn_res: Optional[AttnResidual],
+        sharded: bool = False,
+        bank_sharded: bool = False,
     ) -> torch.Tensor:
         """Stream value after `layer_idx`: the pre-norm mixture its next
         consumer would compute (next layer's attention side; output side
-        for the last layer)."""
+        for the last layer).
+
+        Under the SP carry the layer output is a token shard and the bank
+        holds only this rank's snapshot rows, so both are reassembled to the
+        full batch before the per-row aggregation — the result matches the
+        full-batch reference (up to the SP reduction order). `bank_sharded`
+        can stay True after the carry breaks at a dense layer: the early
+        bank rows were written rows-scoped and need the gather even when the
+        current hidden_states is already full.
+        """
         if attn_res is None:
             return hidden_states if residual is None else hidden_states + residual
         if residual is not None:
             # Materialize a delayed MLP add (mirrors the PP-wire fold).
             hidden_states = residual + hidden_states
+        if sharded:
+            hidden_states = _sp_all_gather_rows(hidden_states)
+        bank = attn_res.block_residual
+        if bank_sharded:
+            bank = _sp_all_gather_bank(bank)
         if layer_idx + 1 < self.end_layer:
             next_layer = self.layers[layer_idx + 1]
             score_proj = next_layer.self_attention_res_proj
