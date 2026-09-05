@@ -879,6 +879,9 @@ class Envs:
     # ===================================================================
     SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)
     SGLANG_NPU_USE_MULTI_STREAM = EnvBool(False)
+    # Kimi-K3 attention-TP shared experts: overlap AG / MLP / RS with the
+    # routed front / DeepEP dispatch / routed GEMMs, respectively.
+    SGLANG_NPU_FINE_GRAINED_MOE_DUAL_STREAM = EnvBool(False)
     SGLANG_NPU_USE_MLAPO = EnvBool(False)
     # Fuse grouped Kimi-K3 SiTU with valid-row MXFP8 quantization before GMM2.
     # Set to 0 to restore the separate SiTU + npu_dynamic_mx_quant path.
@@ -886,6 +889,9 @@ class Envs:
     # Use FIAS V2 for DSpark MLA target verify and MHA draft paths. Graph
     # replay requires torch_npu's V2 handler to update actual_seq_kvlen.
     SGLANG_NPU_USE_FIAS_V2_BSND = EnvBool(False)
+    # Submit DSpark FIA graph updates on the calling thread to avoid the
+    # per-layer host task-queue drain. Requires TorchNPU SyncLaunchStream.
+    SGLANG_NPU_GRAPH_UPDATE_SYNC_LAUNCH = EnvBool(False)
     # Forward native implementation for activation gelu tanh for model Skywork-Reward-Gemma-2-27B-v0.2
     SGLANG_NPU_FORWARD_NATIVE_GELUTANH = EnvBool(False)
     # Forward native implementation for gemma rms norm for model Skywork-Reward-Gemma-2-27B-v0.2
