@@ -433,18 +433,6 @@ class AscendKDAAttnBackend(KDAAttnBackend):
         k = k.unflatten(-1, (-1, layer.head_k_dim)).unsqueeze(0)
         v = v.unflatten(-1, (-1, layer.head_v_dim)).unsqueeze(0)
 
-        # Activate the forget gate and beta in FP32 before entering the
-        # recurrent kernel to match the checkpoint's verify contract.
-        # This stays in the Ascend backend so shared/GPU model code is unchanged.
-        preactivated_a = fused_kda_gate_npu(
-            dense_a.flatten(-2),
-            layer.A_log,
-            layer.head_k_dim,
-            gate_bias=layer.dt_bias,
-            lower_bound=layer.lower_bound,
-        )
-        preactivated_b = dense_b.float().sigmoid()
-
         # Pre-seed intermediate buffer step-0 slots with persistent state.
         intermediate_state[intermediate_indices, 0] = cache.temporal[cache_indices[:batch_size]]
 
@@ -464,9 +452,16 @@ class AscendKDAAttnBackend(KDAAttnBackend):
         q_tnd = q.squeeze(0)
         k_tnd = k.squeeze(0)
         v_tnd = v.squeeze(0)
-        gate_tnd = preactivated_a.squeeze(0) if preactivated_a.shape[0] == 1 else preactivated_a
+        gate_tnd = dense_a.squeeze(0) if dense_a.shape[0] == 1 else dense_a
         beta_tnd = (
-            preactivated_b.squeeze(0) if preactivated_b.shape[0] == 1 else preactivated_b
+            dense_b.squeeze(0) if dense_b.shape[0] == 1 else dense_b
+        )
+
+        num_accepted_tokens = torch.full(
+            (batch_size,),
+            draft_token_num,
+            dtype=torch.int32,
+            device=mixed_qkv.device,
         )
 
         out = torch.ops.npu.recurrent_kda(
@@ -480,11 +475,11 @@ class AscendKDAAttnBackend(KDAAttnBackend):
             ssm_indices,
             layer.A_log,
             layer.dt_bias,
-            None,  # num_accepted_tokens
+            num_accepted_tokens,
             scale=layer.head_k_dim**-0.5,
             use_qk_l2norm_in_kernel=True,
-            use_gate_in_kernel=False,
-            use_beta_sigmoid_in_kernel=False,
+            use_gate_in_kernel=True,
+            use_beta_sigmoid_in_kernel=True,
             allow_neg_eigval=False,
             safe_gate=layer.lower_bound is not None,
             lower_bound=(
