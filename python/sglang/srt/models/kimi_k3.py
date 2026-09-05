@@ -9,7 +9,7 @@
 import logging
 from collections.abc import Iterable
 from functools import cached_property
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, ClassVar, List, Optional, Tuple
 
 import torch
 from torch import nn
@@ -74,7 +74,6 @@ from sglang.srt.layers.moe.utils import (
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
-from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -178,6 +177,17 @@ def _get_k3_dense_weight(module: nn.Module) -> torch.Tensor:
         module.quant_method.weight_block_size,
         module.params_dtype,
     )
+
+
+def _get_k3_qkvgb_merge_flags(
+    use_full_rank_gate: bool,
+) -> tuple[bool, bool]:
+    """Resolve the NPU-only QKVGB and QKVGBFA opt-in flags."""
+    merge_qkvgb = (
+        _is_npu and envs.SGLANG_NPU_K3_MERGED_QKVGB.get() and use_full_rank_gate
+    )
+    merge_qkvgb_fa = merge_qkvgb and envs.SGLANG_NPU_K3_MERGED_QKVGBFA.get()
+    return merge_qkvgb, merge_qkvgb_fa
 
 
 def _k3_bf16_gemm(
@@ -1467,15 +1477,13 @@ class KimiK3DeltaAttention(nn.Module):
             quant_config, f"{prefix}.b_proj"
         )
 
-        # The full-rank [q, k, v, g] merged projection is explicitly sharded
-        # with attn_tp_rank/attn_tp_size, so it also supports DP attention.
-        # The low-rank fused path still uses full-TP-only projection helpers.
-        # For the full-rank gate (K3) the checkpoint quantizes only the MoE
-        # experts; attention linears resolve to UnquantizedLinearMethod, so a
-        # non-None quant_config is fine for the merged projection.
-        self.do_fuse_qkvbfg = (
-            quant_config is None and self.attn_tp_size == self.tp_size
-        )
+        # A5 already shards the full-rank QKVG projection by attention TP.
+        # Keep its low-rank fusion guard and gate the additional beta/FA merge.
+        (
+            self._npu_merged_qkvgb,
+            self._npu_merged_qkvgb_fa,
+        ) = _get_k3_qkvgb_merge_flags(self.use_full_rank_gate)
+        self.do_fuse_qkvbfg = quant_config is None and self.attn_tp_size == self.tp_size
 
         if self.use_full_rank_gate:
             # Fuse only the alignment-friendly wide projections [q, k, v, g]
@@ -1531,6 +1539,9 @@ class KimiK3DeltaAttention(nn.Module):
             # _merge_bfa_weights().
             self._bfa_w: Optional[torch.Tensor] = None
             self._bfa_f_b_w: Optional[torch.Tensor] = None
+            # NPU-only merged [q,k,v,g | beta | pad] weight. Appending beta to
+            # the wide projection removes a poorly utilized six-row GEMM.
+            self._qkvgb_w: Optional[torch.Tensor] = None
         elif self.do_fuse_qkvbfg:
             self.qkvb_sizes = [
                 projection_size,
@@ -1769,6 +1780,88 @@ class KimiK3DeltaAttention(nn.Module):
             self._bfa_f_b_w = self.f_b_proj.weight
         self._bfa_fa_size, self._bfa_b_size = sizes
 
+    def _merge_qkvgb_weights(self) -> None:
+        """Append beta to the full-rank qkvg projection on NPU.
+
+        At attention-TP16, the standalone [B, 7168] x [6, 7168] beta GEMM
+        takes about as long as the [3072, 7168] qkvg GEMM and gates the
+        side-stream join. Padding qkvgb to eight output rows preserves the
+        wide GEMM's alignment while eliminating that under-utilized kernel.
+        """
+        if not self._npu_merged_qkvgb:
+            return
+        mods = [self.fused_qkvg_proj, self.b_proj]
+        if self._npu_merged_qkvgb_fa:
+            mods.append(self.f_a_proj)
+        if any(getattr(mod, "weight", None) is None for mod in mods):
+            return
+        if self._bfa_uses_block_fp8:
+            for mod in mods:
+                if (
+                    getattr(mod, "weight_scale_inv", None) is None
+                    or getattr(
+                        getattr(mod, "quant_method", None),
+                        "weight_block_size",
+                        None,
+                    )
+                    is None
+                ):
+                    raise RuntimeError(
+                        "K3 QKVGB expected every merged block-FP8 projection "
+                        f"to provide weight_scale_inv and weight_block_size; "
+                        f"got {type(mod).__name__} at {self.prefix}."
+                    )
+            # Keep the serialized FP8 source parameters intact. Besides
+            # making repeated post-load hooks idempotent, this lets partial,
+            # sharded, and remote loaders update any subset safely before the
+            # dense serving buffer is rebuilt. Re-pointing these parameters at
+            # BF16 slices would make a later partial reload indistinguishable
+            # from already-dequantized values and could apply block scales
+            # twice.
+            sizes = [mod.weight.shape[0] for mod in mods]
+            pad = (-sum(sizes)) % 8
+            first_weight = _get_k3_dense_weight(mods[0])
+            merged_shape = (sum(sizes) + pad, first_weight.shape[1])
+            if (
+                self._qkvgb_w is None
+                or self._qkvgb_w.shape != merged_shape
+                or self._qkvgb_w.dtype != first_weight.dtype
+                or self._qkvgb_w.device != first_weight.device
+            ):
+                self._qkvgb_w = first_weight.new_empty(merged_shape)
+            offset = 0
+            for mod, size in zip(mods, sizes):
+                dense_weight = (
+                    first_weight if offset == 0 else _get_k3_dense_weight(mod)
+                )
+                self._qkvgb_w[offset : offset + size].copy_(dense_weight)
+                offset += size
+            if pad:
+                self._qkvgb_w[offset:].zero_()
+        else:
+            supported_dtypes = {
+                torch.float16,
+                torch.bfloat16,
+                torch.float32,
+            }
+            for mod in mods:
+                if (
+                    mod.weight.dtype not in supported_dtypes
+                    or getattr(mod, "weight_scale", None) is not None
+                    or getattr(mod, "weight_scale_inv", None) is not None
+                ):
+                    raise RuntimeError(
+                        "K3 QKVGB only supports unquantized FP16/BF16/FP32 "
+                        "projections or ModelOpt FP8_PB_WO. Unsupported "
+                        f"projection {type(mod).__name__} at {self.prefix} "
+                        f"has dtype={mod.weight.dtype}."
+                    )
+            if self._qkvgb_w is not None:
+                return
+            self._qkvgb_w, sizes = _merge_weights_as_views(mods, pad_rows_to=8)
+        self._qkvgb_qkvg_size, self._qkvgb_b_size = sizes[:2]
+        self._qkvgb_fa_size = sizes[2] if len(sizes) == 3 else 0
+
     def _prepare_fused_decode(self) -> None:
         """Static inputs for the fused KDA decode kernel
         (kernels/ops/attention/kda_fused_decode): per-segment transposed fp32 conv
@@ -1826,7 +1919,21 @@ class KimiK3DeltaAttention(nn.Module):
 
     def forward_qkvbfg_fused(self, hidden_states: torch.Tensor):
         if self.use_full_rank_gate:
-            if self._bfa_w is not None:
+            if getattr(self, "_qkvgb_w", None) is not None:
+                n_qkvg = self._qkvgb_qkvg_size
+                n_b = self._qkvgb_b_size
+                n_fa = self._qkvgb_fa_size
+                if n_fa:
+                    qkvgb = _k3_bf16_gemm(hidden_states, self._qkvgb_w)
+                    fa = qkvgb[..., n_qkvg + n_b : n_qkvg + n_b + n_fa]
+                    forget_gate = self.f_b_proj(fa)[0]
+                else:
+                    qkvgb = _k3_bf16_gemm(hidden_states, self._qkvgb_w)
+                    forget_gate = self.f_b_proj(self.f_a_proj(hidden_states)[0])[0]
+                qkvg = qkvgb[..., :n_qkvg]
+                beta = qkvgb[..., n_qkvg : n_qkvg + n_b]
+                qkv, g_proj_states = torch.split(qkvg, self.split_sizes, dim=-1)
+            elif self._bfa_w is not None:
                 w = self._bfa_w
                 n_fa, n_b = self._bfa_fa_size, self._bfa_b_size
                 from sglang.kernels.ops.kimi_k3 import kimi_k3_tiny_gemm as gemm
@@ -2899,10 +3006,10 @@ class KimiK3LinearModel(nn.Module):
 class KimiK3LinearForCausalLM(nn.Module):
     """Text-only K3 causal LM."""
 
-    # ModelSlim describes quantization with the original checkpoint module
-    # names. Register the runtime fused QKVG module so it can resolve the
-    # q_proj scheme while the weight loader packs q/k/v/g into its shards.
-    packed_modules_mapping = {
+    # The loader resolves the quantization method before constructing the
+    # model, so the text-only entry class must advertise the fused runtime
+    # module just like the multimodal wrapper does.
+    packed_modules_mapping: ClassVar[dict] = {
         "fused_qkvg_proj": ["q_proj", "k_proj", "v_proj", "g_proj"],
     }
 
@@ -2916,14 +3023,33 @@ class KimiK3LinearForCausalLM(nn.Module):
         self.config = config
         self.quant_config = quant_config
         if quant_config is not None:
-            if isinstance(quant_config, ModelSlimConfig):
+            # ModelSlim keeps text mappings under the nested ``model`` key;
+            # other quantizers consume the regular flat mapping.
+            text_mapping = {
+                name: shards
+                for name, shards in self.packed_modules_mapping.items()
+                if isinstance(shards, list)
+            }
+            is_modelslim = False
+            if _is_npu:
+                from sglang.srt.layers.quantization.modelslim.modelslim import (
+                    ModelSlimConfig,
+                )
+
+                is_modelslim = isinstance(quant_config, ModelSlimConfig)
+            if is_modelslim:
                 model_mapping = {
                     **quant_config.packed_modules_mapping.get("model", {}),
-                    **self.packed_modules_mapping,
+                    **text_mapping,
                 }
                 quant_config.update_packed_modules_mapping({"model": model_mapping})
             else:
-                quant_config.update_packed_modules_mapping(self.packed_modules_mapping)
+                quant_config.update_packed_modules_mapping(
+                    {
+                        **(quant_config.packed_modules_mapping or {}),
+                        **text_mapping,
+                    }
+                )
         self.model = KimiK3LinearModel(
             config, quant_config, prefix=maybe_prefix(prefix, "model")
         )
@@ -3251,10 +3377,10 @@ class KimiK3LinearForCausalLM(nn.Module):
         if hasattr(self.model, "output_attn_res_proj"):
             _warm_cw(self.model.output_attn_res_proj, self.model.output_attn_res_norm)
 
-        # Post-load: merge the horizontally-fused decode weights. Module
-        # weights are re-pointed to views of the merged buffers (net extra
-        # memory ~0), so this must run after all weights are loaded and
-        # before cuda graph capture.
+        # Post-load: merge the horizontally-fused decode weights. Unquantized
+        # sources are re-pointed to merged-buffer views; serialized block-FP8
+        # QKVGB sources remain intact so reloads can rebuild the dense serving
+        # buffer safely. This must run after loading and before graph capture.
         for layer in self.model.layers:
             if isinstance(layer, PPMissingLayer):
                 continue
@@ -3268,6 +3394,7 @@ class KimiK3LinearForCausalLM(nn.Module):
                 if bias.dtype != torch.float32:
                     bias.data = bias.data.to(torch.float32)
             if isinstance(layer.self_attn, KimiK3DeltaAttention):
+                layer.self_attn._merge_qkvgb_weights()
                 layer.self_attn._merge_bfa_weights()
                 layer.self_attn._prepare_fused_decode()
 
