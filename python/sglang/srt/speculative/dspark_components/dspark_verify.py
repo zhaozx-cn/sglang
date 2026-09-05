@@ -76,6 +76,7 @@ def verify_logits_adjustments_are_noop(sampling_info) -> bool:
 class TargetVerifyResult(msgspec.Struct, frozen=True):
     logits_output: object
     can_run_cuda_graph: bool
+    expert_distribution_metrics: object = None
 
 
 class TargetVerifyExecutor:
@@ -311,6 +312,7 @@ class TargetVerifyExecutor:
         return TargetVerifyResult(
             logits_output=target_out.logits_output,
             can_run_cuda_graph=target_out.can_run_cuda_graph,
+            expert_distribution_metrics=target_out.expert_distribution_metrics,
         )
 
     def commit_hidden(

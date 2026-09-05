@@ -28,6 +28,8 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers import (
     k3_ar_fusion,
     k3_gemm_ar,
@@ -891,11 +893,15 @@ class KimiK3MoE(nn.Module):
             return False
         if self.gate.e_score_correction_bias is None:
             return False
-        # K3 calls self.topk() without a padding mask or EPLB dispatch info, so
-        # select_experts' post-processing collapses to the capture hook and the
-        # recorder -- both of which build_precomputed_topk_output runs. Bail out
-        # if that ever stops holding rather than silently dropping the remap.
-        if not precomputed_topk_postprocess_is_noop(cfg):
+        # A non-trivial expert placement requires select_experts to translate
+        # logical expert ids to the physical slots whose weights were populated
+        # by FusedMoE.weight_loader. The precomputed fused-front path cannot do
+        # that post-processing, so keep it disabled whenever dispatch metadata
+        # is active.
+        if not precomputed_topk_postprocess_is_noop(
+            cfg,
+            expert_location_dispatch_info=self._expert_location_dispatch_info(),
+        ):
             return False
         if get_exec().deterministic.enable_deterministic_inference:
             return False
@@ -904,6 +910,17 @@ class KimiK3MoE(nn.Module):
         except Exception:
             return False
         return moe_front.available()
+
+    def _expert_location_dispatch_info(self):
+        return ExpertLocationDispatchInfo.init_new(layer_id=self.layer_idx)
+
+    def _select_experts(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
+        """Select logical experts and remap them to their loaded physical slots."""
+        return self.topk(
+            hidden_states,
+            router_logits,
+            expert_location_dispatch_info=self._expert_location_dispatch_info(),
+        )
 
     @cached_property
     def _ep_front_eligible(self) -> bool:
@@ -984,7 +1001,7 @@ class KimiK3MoE(nn.Module):
         self.alt_stream.wait_stream(current_stream)
         with torch.cuda.stream(self.alt_stream):
             router_logits = self.gate(hidden_states)
-            topk_output = self.topk(hidden_states, router_logits)
+            topk_output = self._select_experts(hidden_states, router_logits)
 
         routed_input, _ = self.routed_expert_down_proj(hidden_states)
         current_stream.wait_stream(self.alt_stream)
@@ -1091,7 +1108,7 @@ class KimiK3MoE(nn.Module):
             # or dsv3_router_gemm); non-CUDA falls back to F.linear (bf16). The
             # fp32 logits reach the radix router from moe_fused_gate.
             router_logits = self.gate(hidden_states)
-            topk_output = self.topk(hidden_states, router_logits)
+            topk_output = self._select_experts(hidden_states, router_logits)
         if not (_is_npu and self._sbo_shared_overlap):
             issue_shared()
 
@@ -1193,7 +1210,7 @@ class KimiK3MoE(nn.Module):
         if self._route_quant_fuse_eligible:
             route_quant_handoff.stage(routed_input)
         try:
-            topk_output = self.topk(hidden_states, router_logits)
+            topk_output = self._select_experts(hidden_states, router_logits)
             with zero_copy_context.set_moe_output(latent):
                 expert_output = self.experts(routed_input, topk_output)
         finally:
@@ -1209,7 +1226,7 @@ class KimiK3MoE(nn.Module):
         if self._route_quant_fuse_eligible:
             route_quant_handoff.stage(routed_input)
         try:
-            topk_output = self.topk(hidden_states, router_logits)
+            topk_output = self._select_experts(hidden_states, router_logits)
             return self.experts.forward_deferred_finalize(routed_input, topk_output)
         finally:
             route_quant_handoff.clear()
@@ -2945,6 +2962,16 @@ class KimiK3LinearForCausalLM(nn.Module):
     def get_input_embeddings(self):
         return self.model.embed_tokens
 
+    @classmethod
+    def get_model_config_for_expert_location(cls, config: KimiLinearConfig):
+        if config.num_experts is None:
+            return None
+        return ModelConfigForExpertLocation(
+            num_layers=config.num_hidden_layers,
+            num_logical_experts=config.num_experts,
+            num_groups=config.num_expert_group,
+        )
+
     def set_dspark_layers_to_capture(self, layer_ids: list[int]) -> None:
         if self.pp_group.world_size > 1:
             # Capture layers living on non-last PP ranks would be silently
@@ -3386,6 +3413,12 @@ class KimiK3ForConditionalGeneration(nn.Module):
         # Delegate so DummyModelLoader's post-load hook reaches the LM tower.
         if self.language_model is not None:
             self.language_model.post_load_weights()
+
+    @classmethod
+    def get_model_config_for_expert_location(cls, config: KimiK3Config):
+        return KimiK3LinearForCausalLM.get_model_config_for_expert_location(
+            config.text_config
+        )
 
     def precompile_kernels_after_loading(self) -> None:
         if self.config.language_only:
