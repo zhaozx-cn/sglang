@@ -13,6 +13,11 @@ from sgl_kernel_npu.fla.kda_prefill import (
 from sgl_kernel_npu.fla.kda_target_verify import kda_target_verify_npu
 from sgl_kernel_npu.fla.solve_tril import solve_tril_npu
 from sgl_kernel_npu.fla.utils import prepare_chunk_indices
+from sgl_kernel_npu.mamba.kda_state_commit import (
+    commit_kda_extended_conv_state,
+    move_kda_temporal_snapshot,
+    scatter_kda_conv_snapshot,
+)
 
 from sglang.kernels.ops.attention.fla.cumsum import chunk_local_cumsum
 from sglang.kernels.ops.attention.fla.kda import chunk_kda_scaled_dot_kkt_fwd
@@ -552,14 +557,21 @@ class AscendKDAHybridLinearAttnBackend:
                 )
                 last_steps = last_correct_step_indices.to(torch.int32)
 
-                move_intermediate_cache_kda(
+                if not move_kda_temporal_snapshot(
                     ssm_states,
                     intermediate_state_cache,
                     dst_indices_tensor,
                     src_indices_tensor,
                     last_steps,
-                    h_block_size=1,
-                )
+                ):
+                    move_intermediate_cache_kda(
+                        ssm_states,
+                        intermediate_state_cache,
+                        dst_indices_tensor,
+                        src_indices_tensor,
+                        last_steps,
+                        h_block_size=1,
+                    )
                 draft_token_num = intermediate_state_cache.shape[2]
                 has_conv_snapshots = getattr(
                     self.linear_attn_backend,
@@ -570,59 +582,100 @@ class AscendKDAHybridLinearAttnBackend:
                     intermediate_conv_window_cache = (
                         mamba_caches.intermediate_conv_window[0]
                     )
-                    speculative_state_scatter_npu(
+                    if not scatter_kda_conv_snapshot(
                         conv_states,
                         intermediate_conv_window_cache,
                         dst_indices_tensor,
                         src_indices_tensor,
                         last_steps,
-                    )
+                    ):
+                        speculative_state_scatter_npu(
+                            conv_states,
+                            intermediate_conv_window_cache,
+                            dst_indices_tensor,
+                            src_indices_tensor,
+                            last_steps,
+                        )
                 if mamba_track_indices is not None:
                     assert mamba_steps_to_track is not None
                     mamba_track_indices = mamba_track_indices.to(torch.int32)
                     mamba_steps_to_track = mamba_steps_to_track.to(torch.int32)
 
-                    move_intermediate_cache_kda(
+                    if not move_kda_temporal_snapshot(
                         ssm_states,
                         intermediate_state_cache,
                         mamba_track_indices,
                         src_indices_tensor,
                         mamba_steps_to_track,
-                        h_block_size=1,
-                    )
+                    ):
+                        move_intermediate_cache_kda(
+                            ssm_states,
+                            intermediate_state_cache,
+                            mamba_track_indices,
+                            src_indices_tensor,
+                            mamba_steps_to_track,
+                            h_block_size=1,
+                        )
 
                     if has_conv_snapshots:
-                        speculative_state_scatter_npu(
+                        if not scatter_kda_conv_snapshot(
                             conv_states,
                             intermediate_conv_window_cache,
                             mamba_track_indices,
                             src_indices_tensor,
                             mamba_steps_to_track,
-                        )
-                    else:
-                        track_mask = mamba_steps_to_track >= 0
-                        src_slots = torch.where(
-                            track_mask, dst_indices_tensor, mamba_track_indices
-                        )
-                        conv_states[:, mamba_track_indices] = conv_states[:, src_slots]
-
+                        ):
+                            speculative_state_scatter_npu(
+                                conv_states,
+                                intermediate_conv_window_cache,
+                                mamba_track_indices,
+                                src_indices_tensor,
+                                mamba_steps_to_track,
+                            )
                 if not has_conv_snapshots:
-                    if dst_indices_tensor.numel() > 0:
-                        conv_state_rollback(
-                            conv_states,
-                            dst_indices_tensor,
-                            last_steps,
-                            draft_token_num,
-                        )
-
+                    # PR #35021 keeps all verify-token conv states in one
+                    # extended [window, channel] buffer. Commit tracking slots
+                    # first because they read the unmodified primary window;
+                    # then commit the primary slot in place. Both use #34944's
+                    # one-program-per-request/layer strategy and retain
+                    # conv_state_rollback only as a compatibility fallback.
                     if (
                         mamba_track_indices is not None
                         and mamba_track_indices.numel() > 0
                     ):
-                        conv_state_rollback(
+                        track_committed = commit_kda_extended_conv_state(
                             conv_states,
                             mamba_track_indices,
+                            dst_indices_tensor,
                             mamba_steps_to_track,
+                            draft_token_num,
+                        )
+                        if not track_committed:
+                            track_mask = mamba_steps_to_track >= 0
+                            track_indices = mamba_track_indices[track_mask]
+                            if track_indices.numel() > 0:
+                                conv_states[:, track_indices] = conv_states[
+                                    :, dst_indices_tensor[track_mask]
+                                ]
+                            conv_state_rollback(
+                                conv_states,
+                                mamba_track_indices,
+                                mamba_steps_to_track,
+                                draft_token_num,
+                            )
+
+                    primary_committed = commit_kda_extended_conv_state(
+                        conv_states,
+                        dst_indices_tensor,
+                        dst_indices_tensor,
+                        last_steps,
+                        draft_token_num,
+                    )
+                    if not primary_committed:
+                        conv_state_rollback(
+                            conv_states,
+                            dst_indices_tensor,
+                            last_steps,
                             draft_token_num,
                         )
 
