@@ -78,6 +78,52 @@ def _decode_total_seq_lens(batch: ScheduleBatch) -> int:
     return sum(req.seqlen for req in batch.reqs)
 
 
+def _format_int_counts(values) -> str:
+    return "[" + ",".join(str(int(v)) for v in values.reshape(-1).tolist()) + "]"
+
+
+def _summarize_counts(values, top_k: int = 5) -> str:
+    ints = [int(v) for v in values]
+    n = len(ints)
+    if n == 0:
+        return "n=0"
+    nonzero = [(i, v) for i, v in enumerate(ints) if v > 0]
+    if not nonzero:
+        return f"n={n} all_zero"
+    counts = [v for _, v in nonzero]
+    top = sorted(nonzero, key=lambda x: -x[1])[:top_k]
+    top_s = ",".join(f"{i}:{v}" for i, v in top)
+    return (
+        f"n={n} nonzero={len(nonzero)} zero={n - len(nonzero)} "
+        f"min={min(counts)} max={max(counts)} "
+        f"mean={sum(counts) / len(counts):.1f} "
+        f"top=[{top_s}]"
+    )
+
+
+def _log_per_layer_expert_balancedness(
+    forward_pass_id: int,
+    gpu_physical_count,
+    expert_physical_count,
+) -> None:
+    if gpu_physical_count is None or expert_physical_count is None:
+        return
+    gpu_by_layer = gpu_physical_count.tolist()
+    expert_by_layer = expert_physical_count.tolist()
+    for layer_idx, (gpu_counts, expert_counts) in enumerate(
+        zip(gpu_by_layer, expert_by_layer)
+    ):
+        if layer_idx % 10 != 0 or sum(gpu_counts) <= 0:
+            continue
+        logger.info(
+            f"[Expert Balancedness] "
+            f"forward_pass_id={forward_pass_id} "
+            f"layer={layer_idx} "
+            f"gpu={_summarize_counts(gpu_counts)} "
+            f"expert={_summarize_counts(expert_counts)}"
+        )
+
+
 @dataclasses.dataclass
 class PrefillStats:
     """Stats for logging prefill batch metrics."""
@@ -1015,6 +1061,10 @@ class SchedulerMetricsReporter:
                 if m.reset_server_log_history:
                     for history in self._eplb_balancedness_history:
                         history.clear()
+                # No expert was observed in this forward.  This is not a
+                # perfectly balanced sample and must not enter the windows.
+                if not math.isfinite(balancedness):
+                    return
                 for history in self._eplb_balancedness_history:
                     history.append(balancedness)
                 balancedness_history_means = {
@@ -1024,16 +1074,31 @@ class SchedulerMetricsReporter:
                 }
                 assert m.gpu_physical_count_sum is not None
                 gpu_physical_count_sum = m.gpu_physical_count_sum.item()
+                gpu_totals = (
+                    _format_int_counts(m.gpu_physical_count.sum(dim=0))
+                    if m.gpu_physical_count is not None
+                    else "[]"
+                )
 
                 logger.info(
                     f"[Expert Balancedness] "
                     f"forward_pass_id={m.forward_pass_id} "
                     f"current_pass_balancedness={balancedness:.03f} "
                     f"{''.join(f'last_{size}_average_balancedness={value:.03f} ' for size, value in balancedness_history_means.items())} "
-                    f"gpu_physical_count_sum={gpu_physical_count_sum}"
+                    f"gpu_physical_count_sum={gpu_physical_count_sum} "
+                    f"gpu_physical_count={gpu_totals}"
+                )
+                _log_per_layer_expert_balancedness(
+                    forward_pass_id=m.forward_pass_id,
+                    gpu_physical_count=m.gpu_physical_count,
+                    expert_physical_count=m.expert_physical_count,
                 )
 
-            if self.enable_metrics and exports_expert_balancedness_to_prometheus():
+            if (
+                math.isfinite(balancedness)
+                and self.enable_metrics
+                and exports_expert_balancedness_to_prometheus()
+            ):
                 assert self.metrics_collector is not None
                 self.metrics_collector.increment_eplb_balancedness(
                     forward_mode=batch.forward_mode.name.lower(),

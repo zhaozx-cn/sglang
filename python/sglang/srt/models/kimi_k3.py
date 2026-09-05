@@ -28,6 +28,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers import (
     k3_ar_fusion,
     k3_gemm_ar,
@@ -2945,6 +2946,16 @@ class KimiK3LinearForCausalLM(nn.Module):
     def get_input_embeddings(self):
         return self.model.embed_tokens
 
+    @classmethod
+    def get_model_config_for_expert_location(cls, config: KimiLinearConfig):
+        if config.num_experts is None:
+            return None
+        return ModelConfigForExpertLocation(
+            num_layers=config.num_hidden_layers,
+            num_logical_experts=config.num_experts,
+            num_groups=config.num_expert_group,
+        )
+
     def set_dspark_layers_to_capture(self, layer_ids: list[int]) -> None:
         if self.pp_group.world_size > 1:
             # Capture layers living on non-last PP ranks would be silently
@@ -3386,6 +3397,12 @@ class KimiK3ForConditionalGeneration(nn.Module):
         # Delegate so DummyModelLoader's post-load hook reaches the LM tower.
         if self.language_model is not None:
             self.language_model.post_load_weights()
+
+    @classmethod
+    def get_model_config_for_expert_location(cls, config: KimiK3Config):
+        return KimiK3LinearForCausalLM.get_model_config_for_expert_location(
+            config.text_config
+        )
 
     def precompile_kernels_after_loading(self) -> None:
         if self.config.language_only:

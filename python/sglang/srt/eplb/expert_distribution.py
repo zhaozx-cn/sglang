@@ -70,6 +70,8 @@ class ExpertDistributionMetrics:
     forward_pass_id: int
     eplb_balancedness: torch.Tensor
     gpu_physical_count_sum: Optional[torch.Tensor]
+    gpu_physical_count: Optional[torch.Tensor]
+    expert_physical_count: Optional[torch.Tensor]
     reset_server_log_history: bool
 
     def map_device_tensors(self, fn):
@@ -78,6 +80,10 @@ class ExpertDistributionMetrics:
         self.eplb_balancedness = fn(self.eplb_balancedness)
         if self.gpu_physical_count_sum is not None:
             self.gpu_physical_count_sum = fn(self.gpu_physical_count_sum)
+        if self.gpu_physical_count is not None:
+            self.gpu_physical_count = fn(self.gpu_physical_count)
+        if self.expert_physical_count is not None:
+            self.expert_physical_count = fn(self.expert_physical_count)
 
 
 class ExpertDistributionRecorder(ABC):
@@ -348,6 +354,12 @@ class _SinglePassGatherer(ABC):
                     rank,
                     elastic_ep_enabled=get_exec().moe.elastic_ep_backend is not None,
                 )
+            elif get_exec().moe.deepep_mode == "auto":
+                # AUTO switches between normal and low-latency dispatch per
+                # forward.  Count the post-routing TopK ids in both cases so
+                # graph replay does not depend on a Python-side hook after the
+                # NPU DeepEP low-latency dispatch.
+                return _SelectExpertsSinglePassGatherer(expert_location_metadata, rank)
             else:
                 raise NotImplementedError
 
@@ -746,21 +758,22 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
         single_pass_global_physical_count: torch.Tensor,
         outputs: Dict[str, Any],
     ):
-        gpu_physical_count = compute_gpu_physical_count(
-            single_pass_global_physical_count,
-            num_gpu=self._expert_location_metadata.ep_size,
-        )
-        gpu_physical_count = gpu_physical_count.to(get_device_namespace().device)
+        device = get_device_namespace().device
+        # Clone so a later gatherer.reset() cannot zero the tensor we reduce.
+        physical_count = single_pass_global_physical_count.to(device).clone()
         torch.distributed.reduce(
-            gpu_physical_count, dst=0, op=torch.distributed.ReduceOp.SUM
+            physical_count, dst=0, op=torch.distributed.ReduceOp.SUM
         )
 
         if self._rank == 0:
+            gpu_physical_count = compute_gpu_physical_count(
+                physical_count,
+                num_gpu=self._expert_location_metadata.ep_size,
+            )
             self._handle_metric_eplb_heatmap(gpu_physical_count)
 
-            utilization_rate_gpu = torch.mean(
-                compute_utilization_rate(gpu_physical_count)
-            )
+            gpu_physical_count_sum = gpu_physical_count.sum()
+            utilization_rate_gpu = compute_average_utilization_rate(gpu_physical_count)
             should_track_history = not math.isclose(
                 get_exec().moe.eplb_min_rebalancing_utilization_threshold, 1.0
             )
@@ -769,15 +782,17 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
             outputs["metrics"] = ExpertDistributionMetrics(
                 forward_pass_id=forward_pass_id,
                 eplb_balancedness=utilization_rate_gpu,
-                gpu_physical_count_sum=(
-                    gpu_physical_count.sum() if should_log else None
-                ),
+                gpu_physical_count_sum=(gpu_physical_count_sum if should_log else None),
+                gpu_physical_count=gpu_physical_count if should_log else None,
+                expert_physical_count=physical_count if should_log else None,
                 reset_server_log_history=self._reset_server_log_history,
             )
             self._reset_server_log_history = False
 
             if should_track_history:
-                self._history.append(utilization_rate_gpu.item())
+                utilization_rate = utilization_rate_gpu.item()
+                if math.isfinite(utilization_rate):
+                    self._history.append(utilization_rate)
 
     # TODO refactor
     def _handle_metric_eplb_heatmap(self, gpu_physical_count: torch.Tensor):
@@ -1087,3 +1102,18 @@ def compute_utilization_rate(
         "mean",
     )
     return (avg_gpu_physical_count + 1e-5) / (max_gpu_physical_count + 1e-5)
+
+
+def compute_average_utilization_rate(gpu_physical_count: torch.Tensor):
+    """Average balancedness over layers that routed at least one token."""
+    utilization_rate = compute_utilization_rate(gpu_physical_count)
+    active_layers = gpu_physical_count.sum(dim=-1) > 0
+    num_active_layers = active_layers.sum()
+    average = (utilization_rate * active_layers).sum() / num_active_layers.clamp_min(1)
+    # An all-zero pass has no expert-distribution sample.  Without this marker,
+    # (0 + eps) / (0 + eps) reports a false 1.0.
+    return torch.where(
+        num_active_layers > 0,
+        average,
+        torch.full_like(average, float("nan")),
+    )
