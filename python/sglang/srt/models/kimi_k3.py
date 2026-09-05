@@ -1473,9 +1473,7 @@ class KimiK3DeltaAttention(nn.Module):
         # For the full-rank gate (K3) the checkpoint quantizes only the MoE
         # experts; attention linears resolve to UnquantizedLinearMethod, so a
         # non-None quant_config is fine for the merged projection.
-        self.do_fuse_qkvbfg = (
-            quant_config is None and self.attn_tp_size == self.tp_size
-        )
+        self.do_fuse_qkvbfg = quant_config is None and self.attn_tp_size == self.tp_size
 
         if self.use_full_rank_gate:
             # Fuse only the alignment-friendly wide projections [q, k, v, g]
@@ -1902,13 +1900,26 @@ class KimiK3DeltaAttention(nn.Module):
         # into the recurrence kernel. If the backend leaves the stash
         # unconsumed (env off or shape not covered), apply o_norm here as
         # before.
-        fused_onorm = self._kda_fused_decode_ready and (
-            forward_batch.forward_mode.is_decode()
-            or forward_batch.forward_mode.is_target_verify()
+        npu_fused_verify_onorm = (
+            _is_npu
+            and envs.SGLANG_NPU_FUSED_KDA_ONORM.get()
+            and forward_batch.forward_mode.is_target_verify()
+        )
+        fused_onorm = npu_fused_verify_onorm or (
+            self._kda_fused_decode_ready
+            and (
+                forward_batch.forward_mode.is_decode()
+                or forward_batch.forward_mode.is_target_verify()
+            )
         )
         if fused_onorm:
             self.attn._k3_onorm_gate = g_proj_states
             self.attn._k3_onorm_consumed = False
+            self.attn._k3_onorm_runtime = (
+                (g_proj_states, self.o_norm.weight.data, float(self.o_norm.eps))
+                if npu_fused_verify_onorm
+                else None
+            )
 
         core_attn_out = self.attn(
             forward_batch,
@@ -1919,6 +1930,7 @@ class KimiK3DeltaAttention(nn.Module):
 
         if fused_onorm:
             self.attn._k3_onorm_gate = None
+            self.attn._k3_onorm_runtime = None
             fused_onorm = self.attn._k3_onorm_consumed
         if not fused_onorm:
             norm_gate = g_proj_states.unflatten(-1, (-1, self.head_dim))
