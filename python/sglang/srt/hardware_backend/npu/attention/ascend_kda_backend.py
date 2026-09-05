@@ -10,7 +10,6 @@ from sgl_kernel_npu.fla.kda_prefill import (
     chunk_gla_fwd_o_gk_npu,
     recompute_w_u_fwd_npu,
 )
-from sgl_kernel_npu.fla.kda_target_verify import kda_target_verify_npu
 from sgl_kernel_npu.fla.solve_tril import solve_tril_npu
 from sgl_kernel_npu.fla.utils import prepare_chunk_indices
 
@@ -445,21 +444,54 @@ class AscendKDAAttnBackend(KDAAttnBackend):
             lower_bound=layer.lower_bound,
         )
         preactivated_b = dense_b.float().sigmoid()
-        out = kda_target_verify_npu(
-            A_log=layer.A_log,
-            dt_bias=layer.dt_bias,
-            q=q,
-            k=k,
-            v=v,
-            a=preactivated_a,
-            b=preactivated_b,
-            initial_state_source=cache.temporal,
-            initial_state_indices=cache_indices[:batch_size],
-            intermediate_states_buffer=intermediate_state,
-            intermediate_state_indices=intermediate_indices,
-            cache_steps=draft_token_num,
-            gates_are_preactivated=True,
+
+        # Pre-seed intermediate buffer step-0 slots with persistent state.
+        intermediate_state[intermediate_indices, 0] = cache.temporal[cache_indices[:batch_size]]
+
+        # Build 2D ssm_state_indices [batch, draft_token_num] mapping each
+        # (batch, step) to a slot in the intermediate state pool.
+        device = q.device
+        ssm_indices = (
+            intermediate_indices[:, None].to(torch.int32)
+            * draft_token_num
+            + torch.arange(draft_token_num, device=device, dtype=torch.int32)
         )
+
+        # View intermediate buffer as 4D state pool [scratch*T, H_v, V, K].
+        state_pool = intermediate_state.reshape(-1, *intermediate_state.shape[2:])
+
+        # Remove leading singleton for TND layout.
+        q_tnd = q.squeeze(0)
+        k_tnd = k.squeeze(0)
+        v_tnd = v.squeeze(0)
+        gate_tnd = preactivated_a.squeeze(0) if preactivated_a.shape[0] == 1 else preactivated_a
+        beta_tnd = (
+            preactivated_b.squeeze(0) if preactivated_b.shape[0] == 1 else preactivated_b
+        )
+
+        out = torch.ops.npu.recurrent_kda(
+            q_tnd,
+            k_tnd,
+            v_tnd,
+            gate_tnd,
+            beta_tnd,
+            state_pool,
+            dense_query_start_loc.to(torch.int32),
+            ssm_indices,
+            layer.A_log,
+            layer.dt_bias,
+            None,  # num_accepted_tokens
+            scale=layer.head_k_dim**-0.5,
+            use_qk_l2norm_in_kernel=True,
+            use_gate_in_kernel=False,
+            use_beta_sigmoid_in_kernel=False,
+            allow_neg_eigval=False,
+            safe_gate=layer.lower_bound is not None,
+            lower_bound=(
+                layer.lower_bound if layer.lower_bound is not None else -5.0
+            ),
+        )
+        out = out.unsqueeze(0)
         if dense_token_indices is None:
             return out
         padded_out = out.new_zeros(1, num_dense_tokens + 1, *out.shape[2:])
