@@ -12,6 +12,7 @@ from sgl_kernel_npu.attention.sinks_attention import (
 
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.dllm.config import DllmConfig
+from sglang.srt.hardware_backend.npu.utils import kv_layout_probe
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.ascend_torch_native_backend import (
     AscendTorchNativeAttnBackend,
@@ -1095,6 +1096,7 @@ class AscendAttnBackend(AttentionBackend):
                 layer, forward_batch.out_cache_loc, k, k_rope
             )
         q_nope, q_pe = q, q_rope
+        kv_layout_probe("READ   forward_sparse -> npu_sparse_flash_attention", "ND-ONLY")
         k_nope, k_pe = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
 
         if is_prefill:
@@ -1641,6 +1643,7 @@ class AscendAttnBackend(AttentionBackend):
             # we use the FIA kernel for computation.
             q = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
 
+            kv_layout_probe("READ   forward_extend prefix-cache -> kv_b_proj", "ND-ONLY")
             k_buffer = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
             v_buffer = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
             kv_cached = torch.index_select(
@@ -1745,6 +1748,7 @@ class AscendAttnBackend(AttentionBackend):
                 )
                 use_gqa = layer.tp_q_head_num != layer.tp_k_head_num
 
+                kv_layout_probe("READ   forward_extend v_head_dim==256 -> sdpa", "ND-ONLY")
                 k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
                 v_cache = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
                 kv_cache = torch.cat([k_cache, v_cache], dim=-1)
@@ -2010,6 +2014,7 @@ class AscendAttnBackend(AttentionBackend):
         else:
             c_kv, k_rope = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
             if is_fia_nz():
+                kv_layout_probe("READ   forward_mtp -> FIA", "NZ")
                 k_rope_cache = _reshape_kv_for_fia_nz(
                     k_rope, layer.tp_k_head_num, self.qk_rope_head_dim, self.page_size
                 )
@@ -2017,6 +2022,7 @@ class AscendAttnBackend(AttentionBackend):
                     c_kv, layer.tp_v_head_num, self.kv_lora_rank, self.page_size
                 )
             else:
+                kv_layout_probe("READ   forward_mtp -> FIA", "ND")
                 k_rope_cache = k_rope.view(
                     -1, layer.tp_k_head_num, self.page_size, self.qk_rope_head_dim
                 )
@@ -2386,6 +2392,7 @@ class AscendAttnBackend(AttentionBackend):
         else:
             c_kv, k_rope = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
             if is_fia_nz():
+                kv_layout_probe("READ   forward_decode_graph -> FIA", "NZ")
                 k_rope_cache = _reshape_kv_for_fia_nz(
                     k_rope, layer.tp_k_head_num, self.qk_rope_head_dim, self.page_size
                 )
@@ -2393,6 +2400,7 @@ class AscendAttnBackend(AttentionBackend):
                     c_kv, layer.tp_v_head_num, self.kv_lora_rank, self.page_size
                 )
             else:
+                kv_layout_probe("READ   forward_decode_graph -> FIA", "ND")
                 k_rope_cache = k_rope.view(
                     -1, self.page_size, layer.tp_k_head_num * self.qk_rope_head_dim
                 )
@@ -2757,6 +2765,7 @@ class AscendAttnBackend(AttentionBackend):
             if self.use_fia and (layer.tp_q_head_num // layer.tp_k_head_num) >= 8:
                 """layer.tp_q_head_num // layer.tp_k_head_num < 8 will support in the later version of CANN"""
                 if is_fia_nz():
+                    kv_layout_probe("READ   forward_decode -> FIA", "NZ")
                     kv_c = _reshape_kv_for_fia_nz(
                         kv_c, layer.tp_k_head_num, self.kv_lora_rank, self.page_size
                     )
@@ -2764,6 +2773,7 @@ class AscendAttnBackend(AttentionBackend):
                         k_pe, layer.tp_k_head_num, self.qk_rope_head_dim, self.page_size
                     )
                 else:
+                    kv_layout_probe("READ   forward_decode -> FIA", "ND")
                     kv_c = kv_c.view(
                         -1, self.page_size, layer.tp_k_head_num * self.kv_lora_rank
                     )
@@ -2818,6 +2828,7 @@ class AscendAttnBackend(AttentionBackend):
                 )
                 attn_output = attn_output[:, :, : layer.tp_q_head_num, :]
             else:
+                kv_layout_probe("READ   forward_decode -> _npu_paged_attention_mla", "ND-ONLY")
                 assert (
                     self.graph_mode == False
                 )  # _npu_paged_attention_mla not support graph mode

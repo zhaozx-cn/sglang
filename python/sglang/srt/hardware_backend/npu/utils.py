@@ -448,3 +448,60 @@ def process_routed_expert(hidden_states, topk_output, forward_func):
     with torch.get_device_module().stream(stream):
         shared_output = forward_func(hidden_states, topk_output)
     return shared_output
+
+
+# ****************************** TEMPORARY KV-LAYOUT PROBE ******************************
+# Debug instrumentation for the FIA NZ / ND KV-cache layout investigation.
+# Revert with:  git checkout -- python/sglang/srt/hardware_backend/npu/
+import atexit as _kv_atexit
+import os as _kv_os
+
+_KV_LAYOUT_HITS = {}
+_KV_STARS = "*" * 100
+
+
+def kv_layout_probe(site: str, layout: str) -> None:
+    """Record which KV-cache layout each read/write site actually uses.
+
+    layout is one of:
+      NZ        tile-major, matches an NZ write
+      ND        token-major, matches an ND write
+      ND-ONLY   this site has NO NZ branch at all - if the cache was written
+                NZ, this read is reading it in the wrong layout
+    """
+    key = (site, layout)
+    n = _KV_LAYOUT_HITS.get(key, 0) + 1
+    _KV_LAYOUT_HITS[key] = n
+    if n == 1:  # only the first hit per site, so this cannot flood the log
+        print(
+            f"\n{_KV_STARS}\n"
+            f"***  [KV-LAYOUT]  {layout:<8}  {site}   (pid={_kv_os.getpid()})\n"
+            f"{_KV_STARS}",
+            flush=True,
+        )
+
+
+def _kv_layout_summary() -> None:
+    if not _KV_LAYOUT_HITS:
+        return
+    out = [_KV_STARS, "***" + "  KV-LAYOUT SUMMARY  ".center(94, "*") + "***", _KV_STARS]
+    for (site, layout), n in sorted(_KV_LAYOUT_HITS.items()):
+        out.append(f"***  {layout:<8}  x{n:<10}  {site}")
+    out.append(_KV_STARS)
+    wrote_nz = any(l == "NZ" for (s, l) in _KV_LAYOUT_HITS if s.startswith("WRITE"))
+    nd_only = sorted({s for (s, l) in _KV_LAYOUT_HITS if l == "ND-ONLY"})
+    if wrote_nz and nd_only:
+        out.append("***  " + "!" * 20 + "  MISMATCH CONFIRMED  " + "!" * 20)
+        out.append("***  the cache is WRITTEN as NZ but READ as ND here:")
+        for s in nd_only:
+            out.append(f"***      ---->  {s}")
+    elif wrote_nz:
+        out.append("***  OK - NZ writes, and no ND-only reader was ever hit")
+    else:
+        out.append("***  OK - no NZ write happened (is SGLANG_USE_FIA_NZ set?)")
+    out.append(_KV_STARS)
+    print("\n" + "\n".join(out) + "\n", flush=True)
+
+
+_kv_atexit.register(_kv_layout_summary)
+# **************************** END TEMPORARY KV-LAYOUT PROBE ****************************

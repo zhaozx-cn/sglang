@@ -13,6 +13,7 @@ from sglang.srt.mem_cache.memory_pool import (
     unwrap_write_loc,
 )
 from sglang.srt.utils import get_bool_env_var
+from sglang.srt.hardware_backend.npu.utils import kv_layout_probe
 from sglang.srt.utils.common import is_npu
 
 if TYPE_CHECKING:
@@ -729,9 +730,11 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             cache_v = cache_v.view(self.store_dtype)
 
         if self.use_fia_nz:
+            kv_layout_probe("WRITE  NPUMLATokenToKVPool.set_kv_buffer", "NZ")
             self._set_fia_nz_kv_buffer(layer_id, loc, cache_k, cache_v)
             return
 
+        kv_layout_probe("WRITE  NPUMLATokenToKVPool.set_kv_buffer", "ND")
         torch_npu.npu_scatter_nd_update_(
             self.k_buffer[layer_id - self.start_layer].view(-1, 1, self.kv_lora_rank),
             loc.view(-1, 1),
