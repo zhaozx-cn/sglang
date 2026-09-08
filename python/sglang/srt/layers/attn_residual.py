@@ -452,8 +452,15 @@ class AttnResidual:
         hidden_states: torch.Tensor,
         block_num: int,
         block_residual: Optional[torch.Tensor] = None,
+        num_tokens: Optional[int] = None,
     ) -> None:
-        num_tokens, hidden_size = hidden_states.shape
+        # num_tokens overrides the bank's row count: under the SP carry the
+        # constructor may receive a 1/attn_tp token shard while the bank still
+        # spans the full batch (ranks read/write only their slice through
+        # `rows`).
+        if num_tokens is None:
+            num_tokens = hidden_states.shape[0]
+        hidden_size = hidden_states.shape[1]
         # Frozen snapshot rows [T, NB, H]; raw tensor for PP transfer and the
         # legacy kernel path.
         self.block_residual = hidden_states.new_empty(
