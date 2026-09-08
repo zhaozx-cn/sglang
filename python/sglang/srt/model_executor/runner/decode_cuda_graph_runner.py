@@ -109,6 +109,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_spec,
 )
+from sglang.srt.speculative.dspark_components.dspark_diagnostics import diagnostic_stage
 from sglang.srt.speculative.ragged_verify import resolve_ragged_verify_layout
 from sglang.srt.utils import (
     empty_context,
@@ -516,13 +517,24 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         return self.attn_backend
 
     def _resolve_shared_read_ends(self, attn_backend, forward_mode) -> SharedReadEnds:
+        if getattr(
+            getattr(self, "backend", None),
+            "shared_read_ends_after_replay",
+            False,
+        ):
+            # Direct GE callables consume the staged metadata asynchronously
+            # after Python enters replay.  There is no outer NPUGraph marker to
+            # publish, so the only sound (and cheapest) fence is one event
+            # recorded immediately after the GE launch returns.
+            return SharedReadEnds.POST_REPLAY
         declared = attn_backend.shared_read_ends(forward_mode)
         if (
             declared is SharedReadEnds.IN_REPLAY
             and self.in_graph_metadata_prep_done is None
         ):
-            # TODO: this lands EARLIER than declared; POST_REPLAY is the sound one.
-            return SharedReadEnds.PRE_REPLAY
+            # Without a usable in-graph marker we cannot prove that the reads
+            # finished before replay.  Fence after replay, never before them.
+            return SharedReadEnds.POST_REPLAY
         return declared
 
     def _publish_read_done(self, in_graph: bool):
@@ -1030,7 +1042,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.warmup()
         # warmup() may disable torch.compile for a model whose _can_torch_compile
         # is False; recompute the compile bucket so capture matches.
-        if self.enable_torch_compile and not (get_flags().capture.enable_torch_compile):
+        if self.enable_torch_compile and not get_flags().capture.enable_torch_compile:
             self.enable_torch_compile = False
             _, self.compile_bs = get_batch_sizes_to_capture(
                 self.model_runner, self.captured_req_width
@@ -1273,11 +1285,15 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 f"capture mode ({self.capture_hidden_mode.name})."
             )
 
+    @diagnostic_stage("graph_input_load", device=True)
     def load_batch(
         self,
         forward_batch: ForwardBatch,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ):
+        has_deferred_seq_lens_cpu = (
+            forward_batch.deferred_seq_lens_cpu_resolver is not None
+        )
         ragged_layout = (
             resolve_ragged_verify_layout(forward_batch)
             if self.ragged_verify_mode
@@ -1288,6 +1304,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.deepep_adapter.replay()
 
         if not forward_batch.needs_forward_metadata_init():
+            # Pre-planned callers cannot use the staged upper-bound protocol:
+            # their metadata already exists and may have been built by a
+            # wrapper with stronger ordering requirements.
+            forward_batch.resolve_deferred_seq_lens_cpu()
             # Pre-planned (plan-stream load_batch already ran).
             # In speculative decoding, these two fields are still needed.
             graph_size_key = (
@@ -1396,34 +1416,66 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             capture_forward_mode=self.capture_forward_mode,
             is_encoder_decoder=self.is_encoder_decoder,
         )
-        # Glue-graph fast path: pointer-stable prep (static buffers + pool
-        # tensors only) is captured per key; guards keep every python-visible
-        # branch inside the backends constant for that key.
-        if (
+        glue_eligible = (
             self._metadata_glue is not None
             and not self._metadata_glue.disabled
             and raw_bs == bs
             and not self.enable_two_batch_overlap
             and not self.enable_pdmux
             and self.model_runner.lora_manager is None
-        ):
-            # actual_forward_mode belongs in the key even though the captured
-            # graph always targets capture_forward_mode: DSV4's replay prep
-            # substitutes seq_lens / seq_lens_cpu / seq_lens_sum /
-            # req_pool_indices / out_cache_loc when the runtime mode is IDLE,
-            # so IDLE and active DECODE are different python branches and must
-            # not share a captured graph.
-            self._metadata_glue.run(
-                attn_backend,
-                fb_view,
-                (
-                    bs,
-                    str(self.capture_forward_mode),
-                    str(fb_view.actual_forward_mode),
-                ),
-            )
+        )
+
+        def init_replay_metadata() -> None:
+            if glue_eligible:
+                # actual_forward_mode belongs in the key even though the
+                # captured graph always targets capture_forward_mode: DSV4's
+                # replay prep substitutes runtime inputs for IDLE.
+                self._metadata_glue.run(
+                    attn_backend,
+                    fb_view,
+                    (
+                        bs,
+                        str(self.capture_forward_mode),
+                        str(fb_view.actual_forward_mode),
+                    ),
+                )
+            else:
+                attn_backend.init_forward_metadata_out_graph(fb_view)
+
+        # Glue-graph fast path: pointer-stable prep (static buffers + pool
+        # tensors only) is captured per key; guards keep every python-visible
+        # branch inside the backends constant for that key.
+        if has_deferred_seq_lens_cpu and not glue_eligible:
+            # Queue target block-table/KDA metadata from the scheduler's
+            # page-aligned allocation bound before waiting for exact host
+            # lengths. Device seq_lens is already exact and event-ordered.
+            init_replay_metadata()
+            bound_was_sufficient = forward_batch.resolve_deferred_seq_lens_cpu()
+
+            # fill_from above copied the upper bound into the static host slot.
+            # Replace only that tiny CPU head; all pointer-stable GPU copies
+            # and attention-prep kernels remain queued exactly once.
+            if self.buffer_registry.has_slot("seq_lens_cpu"):
+                seq_lens_cpu_buf = self.buffer_registry.get_slot("seq_lens_cpu").buffer
+                seq_lens_cpu_buf[:raw_bs].copy_(forward_batch.seq_lens_cpu[:raw_bs])
+            fb_view.seq_lens_sum = forward_batch.seq_lens_sum
+
+            if not bound_was_sufficient:
+                # Defensive fallback for an allocator/planner invariant
+                # violation. Correctness wins; rebuild from exact host lengths.
+                init_replay_metadata()
         else:
-            attn_backend.init_forward_metadata_out_graph(fb_view)
+            # Glue capture cannot safely straddle a host callback. Resolve
+            # first, refresh its host input, and retain the established path.
+            if has_deferred_seq_lens_cpu:
+                forward_batch.resolve_deferred_seq_lens_cpu()
+                if self.buffer_registry.has_slot("seq_lens_cpu"):
+                    seq_lens_cpu_buf = self.buffer_registry.get_slot(
+                        "seq_lens_cpu"
+                    ).buffer
+                    seq_lens_cpu_buf[:raw_bs].copy_(forward_batch.seq_lens_cpu[:raw_bs])
+                fb_view.seq_lens_sum = forward_batch.seq_lens_sum
+            init_replay_metadata()
 
         self.raw_bs = raw_bs
         self.raw_num_token = raw_num_token

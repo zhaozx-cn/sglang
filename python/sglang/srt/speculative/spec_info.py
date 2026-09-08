@@ -194,7 +194,11 @@ class SpeculativeAlgorithm(Enum):
         return None
 
     def need_topk(self) -> bool:
-        return self.is_eagle() or self.is_standalone()
+        return (
+            self.is_eagle()
+            or self.is_standalone()
+            or (self.is_dspark() and bool(get_spec_config().enable_draft_prefetch))
+        )
 
     def handle_server_args(self, server_args: ServerArgs) -> None:
         """Hook for per-algorithm server args mutation.

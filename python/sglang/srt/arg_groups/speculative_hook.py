@@ -183,6 +183,68 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
             algo.handle_server_args,
         )
 
+    _check_draft_prefetch(server_args)
+
+
+def _check_draft_prefetch(server_args: ServerArgs) -> None:
+    """Validate the fixed-width EAGLE draft-prefetch pipeline."""
+    cfg = resolving_view(server_args)
+    if not getattr(cfg, "enable_draft_prefetch", False):
+        if getattr(cfg, "skip_draft_prefetch_seq_lens_cpu_sync", False):
+            logger.warning(
+                "--skip-draft-prefetch-seq-lens-cpu-sync only takes effect when "
+                "--enable-draft-prefetch is enabled."
+            )
+        return
+
+    if cfg.speculative_algorithm not in ("EAGLE", "EAGLE3", "DSPARK"):
+        raise ValueError(
+            "--enable-draft-prefetch only supports EAGLE/EAGLE3/NEXTN/DSPARK, got "
+            f"{cfg.speculative_algorithm}."
+        )
+    if cfg.enable_multi_layer_eagle:
+        raise ValueError(
+            "--enable-draft-prefetch does not support --enable-multi-layer-eagle."
+        )
+    if cfg.speculative_eagle_topk != 1:
+        raise ValueError(
+            "--enable-draft-prefetch requires --speculative-eagle-topk=1, got "
+            f"{cfg.speculative_eagle_topk}."
+        )
+    if cfg.speculative_adaptive:
+        raise ValueError(
+            "--enable-draft-prefetch is incompatible with --speculative-adaptive."
+        )
+    if cfg.speculative_use_rejection_sampling:
+        raise ValueError(
+            "--enable-draft-prefetch is incompatible with "
+            "--speculative-use-rejection-sampling."
+        )
+    if cfg.speculative_algorithm == "DSPARK":
+        from sglang.srt.speculative.ragged_verify import (
+            RaggedVerifyMode,
+            read_ragged_verify_mode,
+        )
+
+        if read_ragged_verify_mode() is not RaggedVerifyMode.STATIC:
+            raise ValueError(
+                "--enable-draft-prefetch with DSPARK currently requires "
+                "SGLANG_RAGGED_VERIFY_MODE=static."
+            )
+        if cfg.skip_draft_prefetch_seq_lens_cpu_sync:
+            raise ValueError(
+                "DSPARK draft prefetch currently requires the exact next "
+                "sequence lengths on CPU for Ascend FIA; do not set "
+                "--skip-draft-prefetch-seq-lens-cpu-sync."
+            )
+        return
+
+    if cfg.speculative_num_steps is None or int(cfg.speculative_num_steps) < 2:
+        raise ValueError(
+            "--enable-draft-prefetch requires --speculative-num-steps >= 2, got "
+            f"{cfg.speculative_num_steps}."
+        )
+
 
 def _handle_dflash(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
@@ -579,7 +641,6 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
 
     draft_backend = cfg.speculative_draft_attention_backend
     if draft_backend is None:
-
         draft_backend, _ = attention_backends_of(resolved_view(server_args))
     if draft_backend is None:
         draft_backend = fallback_backend

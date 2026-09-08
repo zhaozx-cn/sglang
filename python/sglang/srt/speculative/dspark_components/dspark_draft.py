@@ -18,10 +18,12 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
     enable_num_token_non_padded,
+    should_defer_device_mlp_sync_metadata,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, get_spec
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.draft_worker_common import make_draft_input_v2
+from sglang.srt.speculative.dspark_components.dspark_diagnostics import diagnostic_stage
 from sglang.srt.speculative.dspark_components.dspark_planner import VerifyWindow
 from sglang.srt.speculative.spec_info import (
     SpeculativeAlgorithm,
@@ -29,6 +31,7 @@ from sglang.srt.speculative.spec_info import (
 )
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
 from sglang.srt.speculative.spec_utils import draft_tp_context
+from sglang.srt.utils import is_npu
 from sglang.srt.utils.common import is_pin_memory_available
 from sglang.srt.utils.invariants import Bucket, Invariant, NotNaN, expect
 
@@ -50,18 +53,6 @@ _DRAFT_STEP_LOGITS = Invariant("dspark.draft.step_logits", Bucket.GUARD, NotNaN(
 _DRAFT_PROBS = Invariant(
     "dspark.draft.probs", Bucket.SOFTEN, NotNaN(), recover=_one_hot_token0
 )
-
-
-def _make_num_token_non_padded(
-    num_tokens: int, device: str | torch.device
-) -> Optional[torch.Tensor]:
-    if not enable_num_token_non_padded():
-        return None
-    return torch.tensor(
-        num_tokens,
-        dtype=torch.int32,
-        pin_memory=is_pin_memory_available(device),
-    ).to(device, non_blocking=True)
 
 
 class DraftBlockResult(msgspec.Struct, frozen=True):
@@ -113,7 +104,48 @@ def make_next_draft_input(
     bonus_tokens: torch.Tensor,
     new_seq_lens: torch.Tensor,
 ) -> DFlashDraftInputV2:
-    return make_draft_input_v2(bonus_tokens=bonus_tokens, new_seq_lens=new_seq_lens)
+    draft_input = make_draft_input_v2(
+        bonus_tokens=bonus_tokens, new_seq_lens=new_seq_lens
+    )
+    spec = get_spec()
+    if spec.enable_draft_prefetch and spec.speculative_algorithm == "DSPARK":
+        width = int(
+            spec.speculative_num_draft_tokens
+            or (
+                int(spec.speculative_dspark_block_size) + 1
+                if spec.speculative_dspark_block_size is not None
+                else 0
+            )
+        )
+        if width <= 1:
+            raise ValueError(
+                "DSPARK draft prefetch requires speculative_num_draft_tokens > 1, "
+                f"got {width}."
+            )
+        bs = int(new_seq_lens.numel())
+        device = bonus_tokens.device
+        # Every device element is overwritten before the CPU validity flag is
+        # published.  Use empty storage here: zero-initializing both relay
+        # tensors adds device memset launches between accept and the next Draft
+        # graph without contributing to correctness.  Keeping the fixed width
+        # still gives FutureMap/filters a stable shape.
+        draft_input.topk_p = torch.empty(
+            (bs, width), dtype=torch.float32, device=device
+        )
+        draft_input.topk_index = torch.empty(
+            (bs, width), dtype=torch.int64, device=device
+        )
+        # Prefill/new rows have no prefetched proposal yet. Keep this flag on
+        # CPU so the next decode can choose the normal proposer without a
+        # device-to-host synchronization on topk_p.
+        draft_input.draft_prefetch_valid_cpu = torch.zeros(bs, dtype=torch.bool)
+        # Publish this object as a direct relay only after the worker has
+        # actually produced the prefetched block.  Keeping it false here is
+        # important for skipped/fallback requests and for a clean feature-off
+        # baseline: FutureMap must not bypass its normal topk relay for an
+        # unfilled prefetch buffer.
+        draft_input.draft_prefetch_direct = False
+    return draft_input
 
 
 def resolve_greedy_mask(
@@ -225,6 +257,24 @@ class DraftBlockProposer:
         # Persistent (bs, gamma) mask-token buffer: only column 0 (the bonus
         # token) changes per step, so avoid a fresh torch.full every decode.
         self._draft_block_ids_buf: Optional[torch.Tensor] = None
+        # Keep this scalar on the model device. Creating a temporary pinned
+        # CPU scalar and calling .to(device) after target verify serializes the
+        # host command queue on Ascend until the whole verify forward drains,
+        # defeating overlap scheduling. fill_ only enqueues a device update and
+        # the draft graph consumes it later on the same stream.
+        self._num_token_non_padded_buf: Optional[torch.Tensor] = None
+
+    def _stage_num_token_non_padded(
+        self, num_tokens: int, device: str | torch.device
+    ) -> Optional[torch.Tensor]:
+        if not enable_num_token_non_padded():
+            return None
+        buf = getattr(self, "_num_token_non_padded_buf", None)
+        if buf is None or str(buf.device) != str(device):
+            buf = torch.empty((), dtype=torch.int32, device=device)
+            self._num_token_non_padded_buf = buf
+        buf.fill_(int(num_tokens))
+        return buf
 
     def attach_draft_sampler(self, draft_sampler) -> None:
         self._draft_sampler = draft_sampler
@@ -234,6 +284,7 @@ class DraftBlockProposer:
             return draft_tp_context(get_parallel().attn_tp_group)
         return nullcontext()
 
+    @diagnostic_stage("draft_propose", device=True)
     def propose(
         self,
         *,
@@ -402,7 +453,12 @@ class DraftBlockProposer:
             noise_embedding = embed_module(draft_block_ids)
             draft_input_embeds = noise_embedding.view(-1, noise_embedding.shape[-1])
 
-        if batch.seq_lens_cpu is not None:
+        if draft_input.draft_prefetch_block_table_bound_cpu is not None:
+            # This is an allocation bound only. The Ascend DSPark Tensor FIA
+            # reads the exact prefix lengths from batch.seq_lens on device.
+            draft_seq_lens_cpu = draft_input.draft_prefetch_block_table_bound_cpu
+            draft_seq_lens_sum = None
+        elif batch.seq_lens_cpu is not None:
             draft_seq_lens_cpu = batch.seq_lens_cpu + query_token_num
             draft_seq_lens_sum = int(draft_seq_lens_cpu.sum())
         elif draft_input.nxt_kv_lens_cpu is not None:
@@ -412,6 +468,11 @@ class DraftBlockProposer:
             raise RuntimeError("DSpark decode expected batch.seq_lens_cpu, got None")
 
         draft_num_tokens = bs * query_token_num
+        defer_device_metadata = bool(
+            is_npu()
+            and get_spec().enable_draft_prefetch
+            and batch.can_run_decode_cuda_graph
+        )
         draft_forward_batch = ForwardBatch(
             forward_mode=ForwardMode.TARGET_VERIFY,
             batch_size=bs,
@@ -426,7 +487,11 @@ class DraftBlockProposer:
             spec_algorithm=SpeculativeAlgorithm.DSPARK,
             spec_info=self._draft_block_spec_info,
             capture_hidden_mode=CaptureHiddenMode.NULL,
-            num_token_non_padded=_make_num_token_non_padded(draft_num_tokens, device),
+            num_token_non_padded=(
+                None
+                if defer_device_metadata
+                else self._stage_num_token_non_padded(draft_num_tokens, device)
+            ),
             num_token_non_padded_cpu=draft_num_tokens,
         )
         self._fill_dp_moe_sync_metadata(draft_forward_batch, batch)
@@ -483,14 +548,20 @@ class DraftBlockProposer:
             batch.global_num_tokens_for_logprob,
         )
         device = self.draft_model_runner.device
-        forward_batch.original_global_num_tokens_cpu = batch.global_num_tokens
         num_tokens = forward_batch.input_ids.numel()
-        num_token_non_padded = _make_num_token_non_padded(num_tokens, device)
-        if num_token_non_padded is not None:
-            forward_batch.num_token_non_padded = num_token_non_padded
+        defer_device_metadata = should_defer_device_mlp_sync_metadata(forward_batch)
+        if (
+            getattr(forward_batch, "num_token_non_padded", None) is None
+            and not defer_device_metadata
+        ):
+            num_token_non_padded = self._stage_num_token_non_padded(num_tokens, device)
+            if num_token_non_padded is not None:
+                forward_batch.num_token_non_padded = num_token_non_padded
         forward_batch.num_token_non_padded_cpu = num_tokens
         forward_batch.global_num_tokens_cpu = gnt
         forward_batch.global_num_tokens_for_logprob_cpu = gnt_logprob
+        if defer_device_metadata:
+            return
         pin_memory = is_pin_memory_available(device)
         forward_batch.global_num_tokens_gpu = torch.tensor(
             gnt, dtype=torch.int64, pin_memory=pin_memory

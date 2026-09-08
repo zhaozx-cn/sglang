@@ -28,6 +28,10 @@ def build_eagle_disagg_draft_input(
     num_states = spec.speculative_eagle_topk
     if spec.enable_multi_layer_eagle:
         num_states *= spec.speculative_num_steps
+    elif spec.enable_draft_prefetch and spec.speculative_num_steps > 1:
+        # Prefill pads the first seed to the same fixed-width chain that every
+        # subsequent draft-prefetch round publishes.
+        num_states *= spec.speculative_num_steps
 
     topk_p = torch.stack(
         [

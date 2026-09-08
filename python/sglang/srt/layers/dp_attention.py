@@ -105,13 +105,27 @@ class DpPaddingMode(IntEnum):
         # must dispatch the same number of tokens or the device-side handshake
         # deadlocks (idle DP ranks with 0 tokens never signal their peers).
         # Force MAX_LEN so all ranks are padded to equal token counts.
-        from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+        from sglang.srt.layers.moe.utils import (
+            get_deepep_mode,
+            get_moe_a2a_backend,
+        )
 
         moe_a2a_backend = get_moe_a2a_backend()
         if moe_a2a_backend.is_pplx():
             return DpPaddingMode.MAX_LEN
 
-        if moe_a2a_backend.is_deepep_v2() and envs.SGLANG_DEEPEP_V2_FORCE_MAX_LEN.get():
+        # ``--moe-a2a-backend deepep`` on NPU reaches the V2 Ascend operator
+        # when its resolved mode is low-latency; do not key this protection on
+        # the separate ``deepep_v2`` backend name alone.
+        uses_symmetric_low_latency = moe_a2a_backend.is_deepep_v2() or (
+            moe_a2a_backend.is_deepep()
+            and get_deepep_mode().resolve(is_extend_in_batch).is_low_latency()
+        )
+        if uses_symmetric_low_latency:
+            # Ascend DeepEP low-latency dispatch is a symmetric collective.
+            # Unequal nonzero token counts are unsafe for the same reason as
+            # an idle rank: peers can enter different dispatch/notify rounds.
+            # Keep every DP rank at MAX_LEN for deterministic EP64 ordering.
             return DpPaddingMode.MAX_LEN
 
         # When is_extend_in_batch and dp_size > 1, use SUM_LEN to avoid padding

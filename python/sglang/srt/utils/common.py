@@ -860,6 +860,12 @@ def is_mnnvl_fabric_device() -> bool:
     the device name: the GB200/GB300 superchips. Used to auto-select
     fabric-dependent communication paths (NCCL cuMem/MNNVL, custom all-reduce
     v2 multinode, DCP fi_a2a)."""
+    # torch_npu's transfer_to_npu compatibility layer replaces torch.cuda APIs
+    # with NPU APIs.  Checking the CUDA build first avoids initializing an NPU
+    # context (and potentially blocking in get_device_name) for this
+    # NVIDIA-only capability probe.
+    if torch.version.cuda is None:
+        return False
     if not (hasattr(torch, "cuda") and torch.cuda.is_available()):
         return False
     name = (torch.cuda.get_device_name(0) or "").upper()

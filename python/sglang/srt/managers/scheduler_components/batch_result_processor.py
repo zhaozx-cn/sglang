@@ -42,6 +42,7 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.sampling.sampling_observer import CommittedTokens
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
+from sglang.srt.speculative.dspark_components.dspark_diagnostics import diagnostic_stage
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 
@@ -854,6 +855,7 @@ class SchedulerBatchResultProcessor:
         result.grammar_retained_tokens = retained
         result.grammar_advanced = True
 
+    @diagnostic_stage("result_idle")
     def process_batch_result_idle(
         self,
         batch: ScheduleBatch,
@@ -866,6 +868,7 @@ class SchedulerBatchResultProcessor:
             batch.reqs, batch.return_logprob, is_idle_batch=True
         )
 
+    @diagnostic_stage("result_decode")
     def process_batch_result_decode(
         self,
         batch: ScheduleBatch,

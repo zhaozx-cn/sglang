@@ -516,6 +516,17 @@ class Envs:
     SGLANG_DSPARK_FOLDED_PROPOSAL = EnvBool(True)
     SGLANG_DSPARK_STACKED_CTX_KV = EnvBool(True)
     SGLANG_DSPARK_EMBED_IN_GRAPH = EnvBool(True)
+    # Isolate speculative host-metadata staging from draft prefetch itself.
+    # Disabling this retains prefetch/GE and resolves exact target lengths at
+    # the scheduler entry, before constructing target attention metadata.
+    SGLANG_DSPARK_DEFER_TARGET_METADATA = EnvBool(True)
+    # NPU DSPark prefetch: fence the previous Target replay before reusing its
+    # graph inputs/host update bindings, including on idle DP ranks.
+    # Independent of diagnostics; not used by draft or non-prefetch runners.
+    SGLANG_DSPARK_TARGET_GRAPH_REUSE_GUARD = EnvBool(True)
+    # Debug only; empty DIR adds no observer, stream events, or decorated calls.
+    SGLANG_DSPARK_DIAG_DIR = EnvStr("")
+    SGLANG_DSPARK_DIAG_SYNC_PHASES = EnvStr("")
     SGLANG_DSPARK_OPT_MARKOV_W2_BF16 = EnvBool(True)
     SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD = EnvBool(True)
     SGLANG_DSPARK_OPT_FUSED_GREEDY_MARKOV = EnvBool(False)

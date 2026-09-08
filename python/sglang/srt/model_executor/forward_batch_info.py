@@ -55,6 +55,7 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_lora,
     get_parallel,
+    get_spec,
 )
 from sglang.srt.utils import (
     is_cpu,
@@ -80,6 +81,35 @@ _skip_attn_backend_init_warned = False
 
 _is_npu = is_npu()
 _is_cpu = is_cpu()
+
+
+def should_defer_device_mlp_sync_metadata(batch) -> bool:
+    """Keep transient DSPark graph metadata on the host until graph admission.
+
+    Decode graph buffers already own pointer-stable device slots for
+    ``num_token_non_padded`` and the two DP token-count tensors.  Staging
+    throw-away device tensors in :meth:`ForwardBatch.init_new` therefore adds
+    three H2D submissions immediately before every target replay, only for the
+    graph runner to copy/fill its static slots again.  On Ascend those tiny
+    submissions can also drain the queued DSPark draft and expose a host launch
+    bubble.
+
+    Leave the CPU values authoritative for both the target and private draft
+    graph paths.  The decode buffer registry writes them directly into its
+    static device slots in stream order.  If graph admission later fails,
+    ``ModelRunner._prepare_eager_forward_batch`` calls
+    :meth:`ForwardBatch.materialize_device_mlp_sync_metadata` and restores the
+    original eager contract before any model kernel is launched.
+    """
+    return bool(
+        _is_npu
+        and isinstance(batch, ForwardBatch)
+        and batch.spec_algorithm is not None
+        and batch.spec_algorithm.is_dspark()
+        and get_spec().enable_draft_prefetch
+        and batch.can_run_decode_cuda_graph
+        and batch.forward_mode.is_cuda_graph()
+    )
 
 
 def _elastic_should_preserve_local_token_counts(
@@ -467,6 +497,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # === Borrowed from ScheduleBatch: host metadata (CPU lists / mirrors) ===
     # Optional seq_lens on cpu (CPU mirror of seq_lens)
     seq_lens_cpu: Optional[torch.Tensor] = None
+    # NPU DSPark target-only two-phase preparation.  The allocation upper
+    # bound lets graph inputs and attention block tables be staged while the
+    # exact post-accept host mirror is still in flight.  The resolver replaces
+    # it before NPUGraph.update/replay; all other paths leave both fields None.
+    seq_lens_cpu_upper_bound: Optional[torch.Tensor] = None
+    deferred_seq_lens_cpu_resolver: Optional[Callable[[], Tuple[torch.Tensor, int]]] = (
+        None
+    )
 
     # For logprob
     top_logprobs_nums: Optional[List[int]] = None
@@ -635,6 +673,32 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         )
         self.forward_metadata_replan_equivalent = replan_equivalent
 
+    def resolve_deferred_seq_lens_cpu(self) -> bool:
+        """Install exact host lengths and report whether the bound was valid.
+
+        Returns ``True`` when no resolution was pending or every exact per-row
+        target length fits in the allocation bound used for early attention
+        metadata preparation.  A ``False`` result tells the graph runner to
+        conservatively rebuild metadata with the exact lengths.
+        """
+        resolver = self.deferred_seq_lens_cpu_resolver
+        if resolver is None:
+            return True
+
+        # Clear before invoking: an exception must not leave a callback that a
+        # recovery/fallback path could execute twice.
+        self.deferred_seq_lens_cpu_resolver = None
+        exact, exact_sum = resolver()
+        if exact is None:
+            raise RuntimeError("Deferred seq_lens_cpu resolver returned None.")
+
+        upper_bound = self.seq_lens_cpu_upper_bound
+        self.seq_lens_cpu = exact
+        self.seq_lens_sum = int(exact_sum)
+        if upper_bound is None or upper_bound.shape != exact.shape:
+            return False
+        return bool(torch.all(exact.to(torch.int64) <= upper_bound.to(torch.int64)))
+
     def needs_forward_metadata_init(self) -> bool:
         """Single judgment point for whether the forward path must plan.
 
@@ -707,17 +771,58 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         self.original_global_num_tokens_cpu = batch.global_num_tokens
         self.global_num_tokens_cpu = global_num_tokens
+        self.global_num_tokens_for_logprob_cpu = global_num_tokens_for_logprob
+        self.can_run_decode_cuda_graph = batch.can_run_decode_cuda_graph
+        if should_defer_device_mlp_sync_metadata(self):
+            # Decode graph replay consumes registry-owned device buffers.  Do
+            # not allocate and transfer temporary tensors that would be copied
+            # into those buffers once more by the graph runner.
+            self.global_num_tokens_gpu = None
+            self.global_num_tokens_for_logprob_gpu = None
+            return
+
         pin_memory = is_pin_memory_available(device)
         self.global_num_tokens_gpu = torch.tensor(
             global_num_tokens, dtype=torch.int64, pin_memory=pin_memory
         ).to(device, non_blocking=True)
-        self.global_num_tokens_for_logprob_cpu = global_num_tokens_for_logprob
         self.global_num_tokens_for_logprob_gpu = torch.tensor(
             global_num_tokens_for_logprob,
             dtype=torch.int64,
             pin_memory=pin_memory,
         ).to(device, non_blocking=True)
-        self.can_run_decode_cuda_graph = batch.can_run_decode_cuda_graph
+
+    def materialize_device_mlp_sync_metadata(
+        self, device: Union[str, torch.device]
+    ) -> None:
+        """Restore device metadata when a deferred DSPark graph falls back eager."""
+        pin_memory = is_pin_memory_available(device)
+        if (
+            self.num_token_non_padded is None
+            and self.num_token_non_padded_cpu is not None
+            and enable_num_token_non_padded()
+        ):
+            self.num_token_non_padded = torch.tensor(
+                self.num_token_non_padded_cpu,
+                dtype=torch.int32,
+                pin_memory=pin_memory,
+            ).to(device, non_blocking=True)
+        if self.global_num_tokens_cpu is None:
+            return
+        if self.global_num_tokens_gpu is None:
+            self.global_num_tokens_gpu = torch.tensor(
+                self.global_num_tokens_cpu,
+                dtype=torch.int64,
+                pin_memory=pin_memory,
+            ).to(device, non_blocking=True)
+        if (
+            self.global_num_tokens_for_logprob_gpu is None
+            and self.global_num_tokens_for_logprob_cpu is not None
+        ):
+            self.global_num_tokens_for_logprob_gpu = torch.tensor(
+                self.global_num_tokens_for_logprob_cpu,
+                dtype=torch.int64,
+                pin_memory=pin_memory,
+            ).to(device, non_blocking=True)
 
     @classmethod
     def init_new(
@@ -854,7 +959,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             )
 
         num_tokens = len(batch.input_ids) if batch.input_ids is not None else 0
-        if enable_num_token_non_padded():
+        defer_device_mlp_metadata = should_defer_device_mlp_sync_metadata(ret)
+        if enable_num_token_non_padded() and not defer_device_mlp_metadata:
             ret.num_token_non_padded = torch.tensor(
                 num_tokens,
                 dtype=torch.int32,

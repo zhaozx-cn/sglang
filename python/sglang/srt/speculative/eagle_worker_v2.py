@@ -40,7 +40,11 @@ from sglang.srt.model_executor.cuda_graph_config import (
     Phase,
     check_cuda_graph_backend,
 )
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+    ForwardMode,
+)
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.runner import (
     DecodeCudaGraphRunner,
@@ -157,6 +161,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             get_spec().speculative_algorithm
         )
+        self.enable_draft_prefetch = get_spec().enable_draft_prefetch
 
         self._rebuild_topk1_chain_buffers()
 
@@ -742,6 +747,80 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         return parent_list, top_scores_index, draft_tokens, draft_probs
 
+    def _pad_topk_for_draft_prefetch(
+        self, topk_p: torch.Tensor, topk_index: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Normalize the prefill seed to the fixed-width prefetched chain."""
+        if not self.enable_draft_prefetch:
+            return topk_p, topk_index
+
+        if self.hot_token_id is not None:
+            topk_index = self.hot_token_id[topk_index]
+
+        target_width = self.speculative_num_steps * self.topk
+        pad_width = target_width - topk_p.shape[-1]
+        if pad_width < 0:
+            raise ValueError(
+                "draft-prefetch seed width exceeds the configured chain width: "
+                f"{topk_p.shape[-1]} > {target_width}"
+            )
+        if pad_width:
+            topk_p = torch.cat((topk_p, topk_p[:, -1:].expand(-1, pad_width)), dim=1)
+            topk_index = torch.cat(
+                (topk_index, topk_index[:, -1:].expand(-1, pad_width)), dim=1
+            )
+        return topk_p, topk_index
+
+    def prepare_verify_from_draft_prefetch(
+        self, batch: ScheduleBatch
+    ) -> EagleVerifyInput:
+        """Build verify input from the draft chain produced in the prior round."""
+        if batch.forward_mode.is_idle():
+            return EagleVerifyInput.create_idle_input(
+                self.topk,
+                self.speculative_num_steps,
+                self.speculative_num_draft_tokens,
+                self.device,
+            )
+
+        draft_input: EagleDraftInput = batch.spec_info
+        batch_size = draft_input.topk_p.shape[0]
+        num_steps = self.speculative_num_steps
+        parent_list = torch.arange(
+            -1, num_steps - 1, dtype=torch.long, device=self.device
+        ).repeat(batch_size, 1)
+
+        top_scores = torch.topk(
+            draft_input.topk_p,
+            self.speculative_num_draft_tokens - 1,
+            dim=-1,
+        )
+        top_scores_index = torch.sort(top_scores.indices).values
+        maybe_detect_oob(
+            top_scores_index,
+            0,
+            draft_input.topk_index.shape[1],
+            "draft-prefetch top_scores_index",
+        )
+        draft_tokens = torch.gather(
+            draft_input.topk_index, index=top_scores_index, dim=1
+        )
+
+        return build_eagle_verify_input(
+            batch,
+            draft_input,
+            parent_list,
+            top_scores_index,
+            draft_tokens,
+            None,
+            target_worker=self.target_worker,
+            topk=self.topk,
+            num_steps=self.speculative_num_steps,
+            num_draft_tokens=self.speculative_num_draft_tokens,
+            tree_mask_mode=self.tree_mask_mode,
+            device=self.device,
+        )
+
     def _draft_forward_idle(
         self, forward_batch: ForwardBatch, spec_info: EagleDraftInput
     ):
@@ -880,6 +959,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             topk_p, topk_index = fast_sample(probs, num_samples=1)
         else:
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+        topk_p, topk_index = self._pad_topk_for_draft_prefetch(topk_p, topk_index)
         return EagleDraftInput(
             topk_p=topk_p,
             topk_index=topk_index,
@@ -1055,6 +1135,91 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         if self.seed_dsa_topk_from_draft_extend:
             next_draft_input.dsa_topk_indices = dsa_seed_topk_indices
 
+    def draft_prefetch(
+        self,
+        batch: ScheduleBatch,
+        batch_result: GenerationBatchResult,
+    ) -> None:
+        """Run the next round's draft immediately after the current draft extend."""
+        batch_size = batch.seq_lens.shape[0]
+        saved_state = (
+            batch.forward_mode,
+            batch.seq_lens,
+            batch.seq_lens_cpu,
+            batch.seq_lens_sum,
+            batch.spec_info,
+            batch.input_ids,
+        )
+        try:
+            next_draft_input = batch_result.next_draft_input
+            batch.spec_info = next_draft_input
+
+            if not batch.forward_mode.is_idle():
+                batch.forward_mode = ForwardMode.DECODE
+                batch.seq_lens = batch_result.new_seq_lens
+
+                skip_cpu_sync = (
+                    get_spec().skip_draft_prefetch_seq_lens_cpu_sync
+                    or not getattr(self.draft_attn_backend, "needs_cpu_seq_lens", True)
+                )
+                if skip_cpu_sync:
+                    batch.seq_lens_cpu = None
+                    batch.seq_lens_sum = None
+                else:
+                    batch.seq_lens_cpu = batch.seq_lens.to("cpu")
+                    batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+
+                # ForwardBatch uses the input width for DP padding metadata. The
+                # draft loop replaces the values from next_draft_input before use.
+                batch.input_ids = torch.zeros(
+                    batch_size, dtype=torch.int64, device=batch.device
+                )
+
+            forward_batch, can_run_graph = prepare_for_draft(
+                next_draft_input,
+                self.req_to_token_pool,
+                batch,
+                self.cuda_graph_runner,
+                self.draft_runner,
+                self.topk,
+                self.speculative_num_steps,
+            )
+
+            with spec_stage_span("draft_prefetch"):
+                if can_run_graph:
+                    _, _, draft_tokens, _ = self.cuda_graph_runner.execute(
+                        forward_batch
+                    )
+                else:
+                    if not batch.forward_mode.is_idle():
+                        self.draft_attn_backend.init_forward_metadata(forward_batch)
+                        forward_batch.mark_forward_metadata_ready()
+                    _, _, draft_tokens, _ = self.draft_forward(forward_batch)
+
+            if not batch.forward_mode.is_idle():
+                prefetched_tokens = draft_tokens[:, 1:]
+                prefetched_scores = torch.ones_like(
+                    prefetched_tokens, dtype=torch.float32
+                )
+                seed_tokens = next_draft_input.topk_index
+                if self.hot_token_id is not None:
+                    seed_tokens = self.hot_token_id[seed_tokens]
+                next_draft_input.topk_p = torch.cat(
+                    (next_draft_input.topk_p, prefetched_scores), dim=1
+                ).clone()
+                next_draft_input.topk_index = torch.cat(
+                    (seed_tokens, prefetched_tokens), dim=1
+                ).clone()
+        finally:
+            (
+                batch.forward_mode,
+                batch.seq_lens,
+                batch.seq_lens_cpu,
+                batch.seq_lens_sum,
+                batch.spec_info,
+                batch.input_ids,
+            ) = saved_state
+
 
 class EAGLEWorkerV2(BaseSpecWorker):
     def __init__(
@@ -1080,6 +1245,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             get_spec().speculative_algorithm
         )
+        self.enable_draft_prefetch = get_spec().enable_draft_prefetch
 
         # Only the last PP stage runs the draft; other EAGLEWorkerV2 instances
         # return proxies so scheduler dispatch remains rank-uniform.
@@ -1226,7 +1392,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     device=self.device,
                     hidden_size=hidden_size,
                     dtype=hidden_dtype,
-                    topk=self.topk,
+                    topk=self.topk
+                    * (self.speculative_num_steps if self.enable_draft_prefetch else 1),
                     capture_hidden_mode=capture_mode,
                     vocab_size=self.target_worker.model_config.vocab_size,
                 )
@@ -1243,7 +1410,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     speculative_moe_a2a_backend_context(),
                     spec_stage_span("draft"),
                 ):
-                    verify_input: EagleVerifyInput = self.draft_worker.draft(batch)
+                    if self.enable_draft_prefetch:
+                        verify_input = (
+                            self.draft_worker.prepare_verify_from_draft_prefetch(batch)
+                        )
+                    else:
+                        verify_input = self.draft_worker.draft(batch)
             assert verify_input.is_verify_input()
             batch.spec_info = verify_input
             batch_output = self.verify(batch, grammar_barrier=grammar_barrier)
@@ -1265,6 +1437,16 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     spec_stage_span("draft_extend"),
                 ):
                     self.draft_worker._draft_extend_for_decode(batch, batch_output)
+
+                if self.enable_draft_prefetch:
+                    with (
+                        self.draft_worker.draft_tp_context(
+                            self.draft_worker.draft_runner.tp_group
+                        ),
+                        speculative_moe_backend_context(),
+                        speculative_moe_a2a_backend_context(),
+                    ):
+                        self.draft_worker.draft_prefetch(batch, batch_output)
 
             return batch_output
 

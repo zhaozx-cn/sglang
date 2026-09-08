@@ -12,6 +12,10 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_spec,
 )
+from sglang.srt.speculative.dspark_components.dspark_diagnostics import (
+    diagnostic_stage,
+    get_diagnostics,
+)
 from sglang.srt.utils import is_cuda, is_hip, is_npu
 
 if TYPE_CHECKING:
@@ -123,7 +127,6 @@ CONFIDENCE_RELAY_RING_DEPTH: int = CONFIDENCE_RELAY_RING_LAG + 1
 
 
 class ResolvedConfidence(msgspec.Struct):
-
     confidence: torch.Tensor
     generation: torch.Tensor
 
@@ -156,10 +159,15 @@ class RelayPayload:
 
     @classmethod
     def from_draft_input(cls, draft_input: EagleDraftInput) -> RelayPayload:
+        direct_prefetch = bool(getattr(draft_input, "draft_prefetch_direct", False))
         return cls(
             bonus_tokens=draft_input.bonus_tokens,
-            topk_p=draft_input.topk_p,
-            topk_index=draft_input.topk_index,
+            # DSPARK produces these tensors directly into next_draft_input on
+            # the forward stream.  Keep them there and avoid a redundant pool
+            # scatter/gather; the next forward is naturally ordered behind the
+            # producer on that same stream.
+            topk_p=None if direct_prefetch else draft_input.topk_p,
+            topk_index=None if direct_prefetch else draft_input.topk_index,
             hidden_states=draft_input.hidden_states,
             draft_probs=getattr(draft_input, "draft_probs", None),
             dsa_topk_indices=draft_input.dsa_topk_indices,
@@ -167,7 +175,6 @@ class RelayPayload:
 
 
 class ConfidenceRelay(msgspec.Struct):
-
     device: torch.device
     req_pool_size: int
     pool: Any
@@ -284,10 +291,22 @@ class FutureMap:
                 (self.req_pool_size,), dtype=torch.int64, device=self.device
             )
         # Pinned host copy of new_seq_lens_buf + private stream for fwd-prepare
-        # D2H pulls (gated only on publish, off the schedule stream). CUDA-only:
-        # recovers occupancy lost to the WAR barrier (also CUDA-only); other
-        # platforms have no barrier and use the plain .cpu() bootstrap path.
-        if _is_cuda:
+        # D2H pulls (gated only on publish, off the schedule stream).
+        #
+        # CUDA issues this pull lazily from resolve_seq_lens_cpu.  Ascend must
+        # issue it eagerly from publish(): a plain seq_lens.cpu() at the next
+        # scheduler entry drains all work already queued on the forward stream
+        # (target verify, accept/commit and DSPark prefetch), turning an 8-byte
+        # logical dependency into a multi-millisecond host stall.  Publishing
+        # the pinned mirror immediately after accept lets commit, the DSPark GE
+        # graph and scheduler CPU work hide the actual D2H.
+        self.prefetch_seq_lens_cpu_on_publish = (
+            _is_npu
+            and needs_cpu_seq_lens
+            and spec_algo.is_dspark()
+            and get_spec().enable_draft_prefetch
+        )
+        if _is_cuda or self.prefetch_seq_lens_cpu_on_publish:
             self.new_seq_lens_cpu_pinned = torch.empty(
                 (self.req_pool_size,), dtype=torch.int64, pin_memory=True
             )
@@ -295,6 +314,8 @@ class FutureMap:
         else:
             self.new_seq_lens_cpu_pinned = None
             self.fwd_prepare_d2h_stream = None
+        self.seq_lens_d2h_copy_done = None
+        self.seq_lens_d2h_issued = 0
         self.need_topk = False
         self.need_hidden_states = False
         self.topk_p_buf = None
@@ -422,6 +443,16 @@ class FutureMap:
         # FIXME: indices = batch.req_pool_indices, pinned 2 iters via
         # record_batch_in_overlap; record_stream here is redundant.
         indices.record_stream(torch.get_device_module(self.device).current_stream())
+        if getattr(draft_input, "draft_prefetch_direct", False):
+            # The proposal was produced directly into this object by the NPU
+            # background prefetch.  Only the bonus token needs FutureMap's
+            # pool-indexed relay; topk already has the post-filter row layout.
+            draft_input.bonus_tokens = self.output_tokens_buf[indices]
+            if _DEBUG_ASSERT:
+                _assert_nonneg_and_invalidate(
+                    draft_input.bonus_tokens, self.output_tokens_buf, indices
+                )
+            return
         if self.need_topk:
             hidden_states_buf = (
                 self.hidden_states_buf if self.need_hidden_states else None
@@ -457,17 +488,47 @@ class FutureMap:
                 draft_input.bonus_tokens, self.output_tokens_buf, indices
             )
 
-    def resolve_seq_lens_cpu(self, batch: ScheduleBatch) -> None:
-        # Lazy pull from new_seq_lens_buf for spec_v2 (accept_lens not known to
-        # schedule). The CPU mirror is gated by needs_cpu_seq_lens; backends that
-        # opt out take the GPU-only path below. A private D2H stream overlaps the copy.
+    def can_defer_seq_lens_cpu(self, batch: ScheduleBatch) -> bool:
+        """Whether this DSPark round can consume device lengths before host lengths.
+
+        Only a complete, row-stable direct prefetch qualifies.  A fallback
+        proposer may itself need host attention metadata, while a filtered or
+        mixed batch may contain rows for which no prefetched proposal exists.
+        """
+        draft_input = batch.spec_info
+        valid_cpu = getattr(draft_input, "draft_prefetch_valid_cpu", None)
+        future_indices = getattr(draft_input, "future_indices", None)
+        return bool(
+            envs.SGLANG_DSPARK_DEFER_TARGET_METADATA.get()
+            and self.prefetch_seq_lens_cpu_on_publish
+            and self.seq_lens_d2h_issued > 0
+            and batch.forward_mode.is_decode()
+            and not batch.is_extend_in_batch
+            and draft_input is not None
+            and future_indices is not None
+            and future_indices.numel() > 0
+            and getattr(draft_input, "draft_prefetch_direct", False)
+            and valid_cpu is not None
+            and valid_cpu.numel() > 0
+            and bool(torch.all(valid_cpu))
+            and getattr(draft_input, "draft_prefetch_seq_lens_cpu", None) is None
+        )
+
+    def resolve_seq_lens_device(self, batch: ScheduleBatch) -> bool:
+        """Resolve only the device relay, without waiting for the pinned D2H.
+
+        This is the first half of the NPU DSPark fast path.  The gather is
+        ordered by ``publish_ready`` on the schedule stream, so subsequent
+        target-preparation kernels can be queued without making the CPU wait
+        for the preceding target/accept work to finish.
+        """
         draft_input = batch.spec_info
         if draft_input is None:
-            return
+            return False
 
         fi = draft_input.future_indices
         if fi is None:
-            return
+            return False
         if self.publish_ready is not None:
             if _DEBUG_ASSERT:
                 # Consume-once: every event wait must be re-armed by a fresh
@@ -480,6 +541,36 @@ class FutureMap:
             else:
                 self.publish_ready.wait()
         batch.seq_lens = self.new_seq_lens_buf[fi]
+        return True
+
+    @diagnostic_stage("seq_lens_cpu_resolve")
+    def resolve_seq_lens_cpu(
+        self,
+        batch: ScheduleBatch,
+        *,
+        device_resolved: bool = False,
+        relay_input: Optional[Any] = None,
+    ) -> None:
+        # Lazy pull from new_seq_lens_buf for spec_v2 (accept_lens not known to
+        # schedule). The CPU mirror is gated by needs_cpu_seq_lens; backends that
+        # opt out take the GPU-only path below. A private D2H stream overlaps the copy.
+        if not device_resolved and not self.resolve_seq_lens_device(batch):
+            return
+
+        # A deferred DSPark resolver runs from inside the target graph.  By
+        # then DFlashVerifyInput.prepare_for_verify() has replaced
+        # batch.spec_info with a DFlashVerifyInput, which intentionally has no
+        # future_indices.  The scheduler therefore captures the producing
+        # DraftInput and passes it as relay_input.  Non-deferred callers keep
+        # using the live ScheduleBatch value.
+        draft_input = relay_input if relay_input is not None else batch.spec_info
+        fi = getattr(draft_input, "future_indices", None)
+        if fi is None:
+            raise RuntimeError(
+                "Speculative seq_lens CPU resolution requires the producing "
+                "DraftInput.future_indices; the live spec_info was replaced "
+                "before the deferred resolver ran."
+            )
 
         if not self.needs_cpu_seq_lens:
             # GPU gather above is kept (SB.seq_lens must advance each verify);
@@ -493,8 +584,42 @@ class FutureMap:
                 _assert_nonneg_and_invalidate(batch.seq_lens, self.new_seq_lens_buf, fi)
             return
 
+        prefetched_seq_lens_cpu = getattr(
+            draft_input, "draft_prefetch_seq_lens_cpu", None
+        )
+        if prefetched_seq_lens_cpu is not None:
+            # DSPARK already copied these exact post-verify lengths in order to
+            # run its prefetched draft. Reuse that host mirror instead of
+            # synchronizing new_seq_lens_buf to CPU a second time.
+            batch.seq_lens_cpu = prefetched_seq_lens_cpu
+            batch.seq_lens_sum = int(prefetched_seq_lens_cpu.sum())
+            if _DEBUG_ASSERT:
+                _assert_nonneg_and_invalidate(batch.seq_lens, self.new_seq_lens_buf, fi)
+            return
+
         if self.fwd_prepare_d2h_stream is None or self.publish_ready is None:
             batch.seq_lens_cpu = batch.seq_lens.cpu()  # bootstrap / non-CUDA
+            batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+            if _DEBUG_ASSERT:
+                _assert_nonneg_and_invalidate(batch.seq_lens, self.new_seq_lens_buf, fi)
+            return
+
+        if self.prefetch_seq_lens_cpu_on_publish and self.seq_lens_d2h_issued > 0:
+            # publish() already put this copy behind the accept event and ahead
+            # of the remaining forward work.  Synchronizing the private copy
+            # stream cannot wait for the later DSPark replay, unlike .cpu() on
+            # batch.seq_lens/the forward stream.
+            # Only wait for the exact length snapshot.  The private stream can
+            # also carry confidence/debug copies queued after this event;
+            # draining the whole stream needlessly extends the target replay
+            # critical path.
+            if self.seq_lens_d2h_copy_done is not None:
+                self.seq_lens_d2h_copy_done.synchronize()
+            else:
+                self.fwd_prepare_d2h_stream.synchronize()
+            batch.seq_lens_cpu = self.new_seq_lens_cpu_pinned[
+                batch.req_pool_indices_cpu
+            ]
             batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
             if _DEBUG_ASSERT:
                 _assert_nonneg_and_invalidate(batch.seq_lens, self.new_seq_lens_buf, fi)
@@ -515,6 +640,7 @@ class FutureMap:
             # mirror is not poisoned.
             _assert_nonneg_and_invalidate(batch.seq_lens, self.new_seq_lens_buf, fi)
 
+    @diagnostic_stage("seq_lens_publish", device=True)
     def publish(
         self,
         future_indices: torch.Tensor,
@@ -524,6 +650,15 @@ class FutureMap:
         indices = future_indices
         if indices.shape[0] == 0:
             return  # DP idle
+        if (
+            self.prefetch_seq_lens_cpu_on_publish
+            and self.seq_lens_d2h_copy_done is not None
+        ):
+            # The private stream copies the complete pool.  Fence a later pool
+            # update behind that read so interleaved batches cannot overwrite a
+            # row while the previous pinned snapshot is still in flight.  In
+            # steady state this event is long complete before the next verify.
+            self.seq_lens_d2h_copy_done.wait()
         self.new_seq_lens_buf[indices] = new_seq_lens.to(self.new_seq_lens_buf.dtype)
         publish_confidence = self.needs_confidence_relay and confidence is not None
         if publish_confidence:
@@ -534,6 +669,36 @@ class FutureMap:
                 self.publish_ready = torch.get_device_module(self.device).Event()
             self.publish_ready.record()
             self._publish_fresh = True
+        if self.prefetch_seq_lens_cpu_on_publish:
+            assert self.publish_ready is not None
+            assert self.fwd_prepare_d2h_stream is not None
+            assert self.new_seq_lens_cpu_pinned is not None
+            diag = get_diagnostics()
+            if diag is not None:
+                diag.emit(
+                    "d2h_dependency",
+                    generation=self.seq_lens_d2h_issued + 1,
+                    publish_event_object=id(self.publish_ready),
+                    previous_copy_event_object=id(self.seq_lens_d2h_copy_done),
+                    copy_torch_stream_id=self.fwd_prepare_d2h_stream.stream_id,
+                    bytes=self.new_seq_lens_buf.numel()
+                    * self.new_seq_lens_buf.element_size(),
+                )
+            self.fwd_prepare_d2h_stream.wait_event(self.publish_ready)
+            with torch.get_device_module(self.device).stream(
+                self.fwd_prepare_d2h_stream
+            ):
+                self.new_seq_lens_cpu_pinned.copy_(
+                    self.new_seq_lens_buf, non_blocking=True
+                )
+                if self.seq_lens_d2h_copy_done is None:
+                    self.seq_lens_d2h_copy_done = torch.get_device_module(
+                        self.device
+                    ).Event()
+                self.seq_lens_d2h_copy_done.record()
+                if diag is not None:
+                    diag.checkpoint("seq_lens_d2h")
+            self.seq_lens_d2h_issued += 1
         if publish_confidence:
             self.confidence_relay.issue_ring_copy(
                 stream=self.fwd_prepare_d2h_stream,
@@ -556,7 +721,11 @@ class FutureMap:
             self.output_tokens_buf.dtype
         )
 
-        if self.need_topk:
+        if (
+            self.need_topk
+            and payload.topk_p is not None
+            and payload.topk_index is not None
+        ):
             self.topk_p_buf[indices] = payload.topk_p.to(self.topk_p_buf.dtype)
             self.topk_index_buf[indices] = payload.topk_index.to(
                 self.topk_index_buf.dtype

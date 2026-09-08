@@ -43,6 +43,7 @@ from sglang.srt.configs.model_config import (
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.runner import DecodeCudaGraphRunner
+from sglang.srt.speculative.dspark_components.dspark_diagnostics import diagnostic_stage
 from sglang.srt.utils import (
     empty_context,
     get_bool_env_var,
@@ -99,6 +100,7 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
         # patch_model with the NPU-specific version.
         from sglang.srt.compilation import torch_compile_decoration
 
+        replay_attn_backend = attn_backend or model_runner.attn_backend
         torch_compile_decoration.patch_model = patch_model_npu
         super().__init__(
             model_runner,
@@ -120,6 +122,25 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
             envs.SGLANG_NPU_USE_FIAS_V2_BSND.get()
             and model_runner.spec_algorithm.is_dspark()
         )
+        self.use_dspark_device_seq_lens = bool(
+            getattr(replay_attn_backend, "use_dspark_device_verify", False)
+        )
+        if model_runner.is_draft_worker and model_runner.spec_algorithm.is_dspark():
+            logger.info(
+                "DSPark draft graph backend=ACLGraph; FIA lengths=%s",
+                "device Tensor" if self.use_dspark_device_seq_lens else "exact CPU",
+            )
+        # Keep the experimentally effective target_reuse fence independent of
+        # diagnostic logging/observation. Idle DP ranks also execute this runner
+        # and can reach the next graph update before the previous replay ends.
+        # Leave draft runners and the non-prefetch baseline unchanged.
+        self.target_graph_reuse_guard = (
+            model_runner.spec_algorithm.is_dspark()
+            and not model_runner.is_draft_worker
+            and model_runner.server_args.enable_draft_prefetch
+            and envs.SGLANG_DSPARK_TARGET_GRAPH_REUSE_GUARD.get()
+        )
+        self._target_graph_reuse_done = None
 
     def _init_arch_map(self):
         if self.is_dllm:
@@ -218,11 +239,32 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
         # for NPU, profile data will be saved to disk for further analysis.
         pass
 
+    @diagnostic_stage("graph", device=True, graph=True)
     def execute(
         self,
         forward_batch: ForwardBatch,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
+        if self._target_graph_reuse_done is not None:
+            # A device-side stream wait cannot order a host graph.update().
+            # Keep the validated host fence before load_batch as well as any
+            # direct input copies. The event belongs to the runner, not a graph
+            # key: different capture buckets share input slots and a graph pool.
+            self._target_graph_reuse_done.synchronize()
+
+        # This override does not call DecodeCudaGraphRunner.execute().  Do not
+        # inherit a previous iteration's event, or assume the base runner will
+        # publish one for the NPU replay below.
+        self.model_runner.shared_read_done_event = None
+        log_graph_key = envs.SGLANG_LOG_DECODE_GRAPH_KEY.get()
+        if log_graph_key:
+            logger.info(
+                "NPU graph prepare: worker=%s mode=%s raw_bs=%d global_counts=%s",
+                "draft" if self.model_runner.is_draft_worker else "target",
+                forward_batch.forward_mode.name,
+                forward_batch.batch_size,
+                forward_batch.original_global_num_tokens_cpu,
+            )
         if forward_batch.needs_forward_metadata_init():
             self.load_batch(forward_batch, pp_proxy_tensors)
         else:
@@ -247,7 +289,14 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
 
         graph_key = self._make_graph_key(self.bs)
 
-        if not (
+        if (
+            self.use_dspark_device_seq_lens
+            and forward_batch.forward_mode.is_target_verify()
+        ):
+            # The DSPark draft graph reads the staged device seq_lens tensor.
+            # Do not pull it to CPU or patch FIA host attributes before replay.
+            output = self.backend.replay(graph_key, forward_batch)
+        elif not (
             is_deepseek_dsa(self.model_runner.model_config.hf_config)
             or is_deepseek_v4(self.model_runner.model_config.hf_config)
         ):
@@ -275,6 +324,20 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
         else:
             output = self.backend.replay(graph_key, forward_batch)
 
+        if envs.SGLANG_ENABLE_WAR_BARRIER.get():
+            # NPU has no audited external in-graph read marker. Replay also reads
+            # metadata asynchronously. A post-launch event covers both; a
+            # pre-replay event would let scheduler writes overtake the reads.
+            self._publish_read_done(in_graph=False)
+        if log_graph_key:
+            logger.info(
+                "NPU graph submitted: worker=%s key=%s mode=%s raw_bs=%d",
+                "draft" if self.model_runner.is_draft_worker else "target",
+                graph_key,
+                forward_batch.forward_mode.name,
+                self.raw_bs,
+            )
+
         if isinstance(output, LogitsProcessorOutput):
             if self.is_dllm:
                 next_token_logits = None
@@ -290,7 +353,7 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
                     if output.next_token_logits is not None
                     else None
                 )
-            return LogitsProcessorOutput(
+            result = LogitsProcessorOutput(
                 next_token_logits=next_token_logits,
                 full_logits=full_logits,
                 hidden_states=(
@@ -301,4 +364,15 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
             )
         else:
             assert isinstance(output, PPProxyTensors)
-            return PPProxyTensors({k: v[: self.bs] for k, v in output.tensors.items()})
+            result = PPProxyTensors(
+                {k: v[: self.bs] for k, v in output.tensors.items()}
+            )
+
+        if self.target_graph_reuse_guard:
+            # One event on the existing forward stream, at the same completion
+            # boundary as the diagnostic target_graph checkpoint. The previous
+            # recording was synchronized above before this event is re-recorded.
+            if self._target_graph_reuse_done is None:
+                self._target_graph_reuse_done = self.device_module.Event()
+            self._target_graph_reuse_done.record()
+        return result

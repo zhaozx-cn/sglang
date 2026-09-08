@@ -75,7 +75,6 @@ def _reshape_kv_for_fia_nz(
 
 @dataclass
 class ForwardMetadata:
-
     # calculated map for kv positions [bs * maxseqlen]
     block_tables: Optional[torch.Tensor] = None
 
@@ -303,7 +302,6 @@ def _cp_allgather_and_save_kv_npu(
 
 
 class AscendAttnBackend(AttentionBackend):
-
     def __init__(self, model_runner: ModelRunner, speculative_step_id: int = 0):
         super().__init__()
         self.forward_metadata = None
@@ -382,6 +380,58 @@ class AscendAttnBackend(AttentionBackend):
             isinstance(self.token_to_kv_pool, SWAKVPool)
             and self.token_to_kv_pool.swa_layer_nums > 0
         )
+        # Only the explicitly selected Tensor FIA consumes device prefix lengths
+        # in ACLGraph. Target Kimi-K3 attention still needs exact host metadata.
+        spec_algorithm = model_runner.spec_algorithm
+        self.use_dspark_tensor_fia = (
+            get_bool_env_var("SGLANG_DSPARK_FIA_TENSOR", "False")
+            and model_runner.is_draft_worker
+        )
+        self._dspark_tensor_fia_op = None
+        if self.use_dspark_tensor_fia:
+            cfg = model_runner.model_config.hf_text_config
+            if (
+                not get_spec().enable_draft_prefetch
+                or spec_algorithm is None
+                or not spec_algorithm.is_dspark()
+                or self.enable_torch_compile
+                or self.use_mla
+                or self.is_hybrid_swa
+                or self.use_sliding_window_kv_pool
+                or self.use_fias_v2_bsnd
+                or not self.use_fia
+                or getattr(self.token_to_kv_pool, "use_hnd", False)
+                or self.token_to_kv_pool.is_quantized_kv_cache
+                or self.page_size != 128
+                or self.speculative_num_draft_tokens != 7
+                or getattr(cfg, "head_dim", None) != 64
+                or getattr(cfg, "num_attention_heads", 0) != 64
+                or getattr(cfg, "num_key_value_heads", 0) != 16
+                or get_parallel().attn_tp_size != 16
+                or getattr(cfg, "is_causal", False)
+                or any(
+                    t != "full_attention"
+                    for t in (getattr(cfg, "layer_types", None) or [])
+                )
+            ):
+                raise ValueError(
+                    "Experimental Tensor FIA requires K3 dense DSPARK, block=7, "
+                    "BF16 ND KV, head_dim=64, local Q/KV heads=4/1, page=128, "
+                    "non-causal full attention, prefetch and plain ACLGraph. "
+                    "torch.compile and SGLANG_NPU_USE_FIAS_V2_BSND are unsupported."
+                )
+            from sglang.srt.hardware_backend.npu.attention.dspark_tensor_fia import (
+                DsparkTensorFIA,
+            )
+
+            self._dspark_tensor_fia_op = DsparkTensorFIA()
+            logger.warning(
+                "EXPERIMENTAL DSPark Tensor FIA: ACLGraph with NPU prefix lengths; "
+                "no GE or host FIA update for supported draft batches. "
+                "Use chip-matched native artifacts; A5 serving validation is pending."
+            )
+        self.use_dspark_device_verify = self.use_dspark_tensor_fia
+        self.needs_cpu_seq_lens = not self.use_dspark_device_verify
 
         # head num padding
         self.padding_size_list = [1, 2, 4, 8, 16, 32, 64, 128]
@@ -454,23 +504,30 @@ class AscendAttnBackend(AttentionBackend):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
         self.forward_metadata = ForwardMetadata()
-        # Empty attention-DP ranks still participate in the target forward.
-        seq_lens_max = forward_batch.seq_lens.max() if forward_batch.batch_size else 0
+        # Under DP attention an idle rank still runs the target-verify model so
+        # that its MoE layers join the global collectives.  SUM_LEN padding
+        # leaves that rank with an empty seq_lens tensor; attention itself has
+        # no local work, but its metadata must remain well formed.
+        empty_local_batch = forward_batch.seq_lens.numel() == 0
+        seq_lens_max = 0 if empty_local_batch else forward_batch.seq_lens.max()
         if forward_batch.forward_mode.is_target_verify():
             spec_tokens_per_req = int(forward_batch.spec_info.draft_token_num)
             # Overlap scheduling can publish the CPU sequence length one step
             # ahead of the device tensor. FIA consumes seq_lens_cpu below, so
             # derive the block-table width from the same source. Otherwise a
             # page-aligned request can expose KV_S=N while asking FIA for N+1.
-            if forward_batch.batch_size:
-                seq_lens_max = (
-                    forward_batch.seq_lens_cpu.max().item() + spec_tokens_per_req
-                )
+            seq_lens_max = (
+                0
+                if forward_batch.seq_lens_cpu.numel() == 0
+                else forward_batch.seq_lens_cpu.max().item()
+                + (0 if self.use_dspark_device_verify else spec_tokens_per_req)
+            )
         elif (
             forward_batch.forward_mode.is_decode_or_idle()
             and forward_batch.spec_info is not None
         ):
-            seq_lens_max += self.speculative_step_id + 1
+            if not empty_local_batch:
+                seq_lens_max += self.speculative_step_id + 1
         self.forward_metadata.block_tables = (
             self.req_to_token_pool.req_to_token[
                 forward_batch.req_pool_indices, :seq_lens_max
@@ -588,6 +645,11 @@ class AscendAttnBackend(AttentionBackend):
         self.graph_mode = False
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
+        if self.use_dspark_tensor_fia and max_bs > 32:
+            raise ValueError(
+                "Tensor FIA only captures draft bs<=32; larger eager batches "
+                "require the exact host-length fallback"
+            )
         total_context_len = self.max_context_len + self.page_size - 1
         if self.speculative_num_draft_tokens is not None:
             total_context_len += self.speculative_num_draft_tokens
@@ -767,7 +829,7 @@ class AscendAttnBackend(AttentionBackend):
         metadata.block_tables[:bs, max_seq_pages:].fill_(0)
         metadata.block_tables[bs:, :].fill_(0)
 
-        if forward_mode.is_target_verify():
+        if forward_mode.is_target_verify() and not self.use_dspark_device_verify:
             seq_lens = seq_lens + self.speculative_num_draft_tokens
         elif forward_mode.is_decode_or_idle() and spec_info is not None:
             seq_lens = seq_lens + self.speculative_step_offset_npu
@@ -1659,9 +1721,7 @@ class AscendAttnBackend(AttentionBackend):
             kv = layer.kv_b_proj(kv_cached)[0].view(
                 -1, layer.tp_k_head_num, self.qk_nope_head_dim + layer.v_head_dim
             )
-            k_nope, v_pre = kv.split(
-                [self.qk_nope_head_dim, layer.v_head_dim], dim=-1
-            )
+            k_nope, v_pre = kv.split([self.qk_nope_head_dim, layer.v_head_dim], dim=-1)
 
             k_rope = k_rope_cached.expand(-1, layer.tp_k_head_num, -1)
             k_pre = torch.cat([k_nope, k_rope], dim=-1)
@@ -1705,9 +1765,7 @@ class AscendAttnBackend(AttentionBackend):
                 )
                 q_len_offset += q_len
                 prefix_len_offset += prefix_len
-            attn_output = attn_output.view(
-                -1, layer.tp_q_head_num * layer.v_head_dim
-            )
+            attn_output = attn_output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
         else:
             if layer.qk_head_dim == layer.v_head_dim:
                 """FIA will support multi-bs in the later version of CANN"""
@@ -1890,6 +1948,13 @@ class AscendAttnBackend(AttentionBackend):
         k_rope: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
     ):
+        # Idle DP-attention ranks have no local attention rows but must keep
+        # executing the surrounding model so MoE collectives see every rank.
+        # Do not submit a zero-token FIA operation; return shape-preserving
+        # zeros for any DP padding rows instead.
+        if forward_batch.num_token_non_padded_cpu == 0:
+            return q.new_zeros((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
+
         if save_kv_cache:
             if self.use_mla:
                 k = k.view(-1, layer.tp_k_head_num, self.kv_lora_rank)
@@ -1909,10 +1974,12 @@ class AscendAttnBackend(AttentionBackend):
                 )
 
         if not self.use_mla:
-            k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id).view(
+            k_cache_raw = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+            v_cache_raw = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
+            k_cache = k_cache_raw.view(
                 -1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim
             )
-            v_cache = self.token_to_kv_pool.get_value_buffer(layer.layer_id).view(
+            v_cache = v_cache_raw.view(
                 -1, self.page_size, layer.tp_v_head_num * layer.v_head_dim
             )
             query = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim).contiguous()
@@ -1921,7 +1988,53 @@ class AscendAttnBackend(AttentionBackend):
                 num_token_padding = query.shape[0]
                 query = query[: forward_batch.num_token_non_padded_cpu]
 
-            if self.forward_metadata.seq_lens_cpu_int is None:
+            if (
+                self.use_dspark_tensor_fia
+                and forward_batch.forward_mode.is_target_verify()
+            ):
+                if layer.attn_type != AttentionType.ENCODER_ONLY or sinks is not None:
+                    raise ValueError(
+                        "Tensor FIA requires non-causal attention without masks or sinks"
+                    )
+                bs = query.shape[0] // 7
+                if query.shape[0] != bs * 7:
+                    raise ValueError("Tensor FIA requires seven query tokens per row")
+                if 1 <= bs <= 32:
+                    attn_output = self._dspark_tensor_fia_op(
+                        query,
+                        k_cache,
+                        v_cache,
+                        self.forward_metadata.block_tables[:bs],
+                        self.forward_metadata.seq_lens[:bs],
+                        scale=layer.scaling,
+                    ).view(-1, layer.tp_q_head_num * layer.v_head_dim)
+                    if not self.graph_mode and query.shape[0] < num_token_padding:
+                        attn_output = torch.cat(
+                            (
+                                attn_output,
+                                attn_output.new_zeros(
+                                    num_token_padding - query.shape[0],
+                                    attn_output.shape[-1],
+                                ),
+                            )
+                        )
+                    return attn_output
+                if self.graph_mode:
+                    raise RuntimeError("Unsupported Tensor FIA graph bucket")
+
+            if (
+                self.use_dspark_tensor_fia
+                and forward_batch.forward_mode.is_target_verify()
+            ):
+                # Eager overflow above 32 rows needs exact host lengths, not
+                # the allocation bound used by device-length prefetch. The
+                # ordinary supported ACLGraph path returns above without D2H.
+                actual_seq_lengths_kv = (
+                    (self.forward_metadata.seq_lens[:bs].to(torch.int64) + 7)
+                    .cpu()
+                    .tolist()
+                )
+            elif self.forward_metadata.seq_lens_cpu_int is None:
                 actual_seq_lengths_kv = self.forward_metadata.seq_lens_cpu_list
             else:
                 actual_seq_lengths_kv = (
@@ -2096,9 +2209,9 @@ class AscendAttnBackend(AttentionBackend):
                 # V2 consumes it with BNSD queries; keep the cache unchanged.
                 batch_size = len(actual_seq_lengths_kv)
                 query_seq_len = self.speculative_num_draft_tokens
-                assert q_nope.shape[0] == batch_size * query_seq_len, (
-                    "FIAS V2 target verify requires one fixed draft block per request"
-                )
+                assert (
+                    q_nope.shape[0] == batch_size * query_seq_len
+                ), "FIAS V2 target verify requires one fixed draft block per request"
                 if batch_size == 0:
                     attn_output = torch.empty_like(q_nope)
                 else:

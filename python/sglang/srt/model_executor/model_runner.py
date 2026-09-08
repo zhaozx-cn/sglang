@@ -1488,6 +1488,10 @@ class ModelRunner:
         forward path needs — the cuda-graph path does the equivalent inside the
         runner's capture/replay, so this is skipped there.
         """
+        # The private DSPark draft graph may defer these tiny transfers.  If
+        # graph admission fails, restore the eager-forward contract here.
+        forward_batch.materialize_device_mlp_sync_metadata(self.device)
+
         # For MLP sync
         if forward_batch.global_num_tokens_cpu is not None:
             forward_batch.prepare_mlp_sync_batch(self)
@@ -1749,6 +1753,12 @@ class ModelRunner:
                     pp_proxy_tensors=pp_proxy_tensors,
                 )
                 return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
+
+            # Graph admission is the only path that can stage pointer-stable
+            # target metadata from an allocation upper bound.  Eager attention
+            # must see the exact post-accept host lengths before any padding or
+            # backend planning is performed.
+            forward_batch.resolve_deferred_seq_lens_cpu()
 
             # DP / MLP-sync padding + attn-tp normalization. Only the decode
             # cuda-graph path above pre-pads its static buffers and returns

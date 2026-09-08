@@ -37,8 +37,8 @@ def _backend(declared: SharedReadEnds):
     [
         # The backend's declaration decides where the record lands.
         (SharedReadEnds.IN_REPLAY, True, SharedReadEnds.IN_REPLAY),
-        # Nowhere to record in-graph -> fall back to the pre-replay record.
-        (SharedReadEnds.IN_REPLAY, False, SharedReadEnds.PRE_REPLAY),
+        # A missing marker must move the fence later, never before the reads.
+        (SharedReadEnds.IN_REPLAY, False, SharedReadEnds.POST_REPLAY),
         # Only an in-graph declaration is demoted; the rest pass through.
         (SharedReadEnds.POST_REPLAY, False, SharedReadEnds.POST_REPLAY),
     ],
@@ -49,6 +49,17 @@ def test_resolve_shared_read_ends(declared, has_marker, expected):
 
     assert runner._resolve_shared_read_ends(backend, DECODE) is expected
     backend.shared_read_ends.assert_called_once_with(DECODE)
+
+
+def test_direct_ge_backend_forces_post_replay_fence():
+    runner = _runner(has_marker=True)
+    runner.backend = SimpleNamespace(shared_read_ends_after_replay=True)
+    backend = _backend(SharedReadEnds.IN_REPLAY)
+
+    assert (
+        runner._resolve_shared_read_ends(backend, DECODE) is SharedReadEnds.POST_REPLAY
+    )
+    backend.shared_read_ends.assert_not_called()
 
 
 def test_publish_read_done():

@@ -4,7 +4,9 @@ upper bound, hybrid needs_cpu_seq_lens delegation, filter_batch host
 keep-list."""
 
 import unittest
+from contextlib import nullcontext
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -256,6 +258,163 @@ class TestHybridNeedsCpuSeqLens(CustomTestCase):
         self.assertFalse(
             self._make(False, False, spec_mode="prefill").needs_cpu_seq_lens
         )
+
+
+class _FakeEvent:
+    def __init__(self):
+        self.record_count = 0
+        self.wait_count = 0
+
+    def record(self):
+        self.record_count += 1
+
+    def wait(self):
+        self.wait_count += 1
+
+
+class _FakeCopyStream:
+    def __init__(self):
+        self.waited = []
+        self.synchronize_count = 0
+
+    def wait_event(self, event):
+        self.waited.append(event)
+
+    def synchronize(self):
+        self.synchronize_count += 1
+
+
+class _FakeDeviceModule:
+    def __init__(self):
+        self.events = []
+
+    def Event(self):
+        event = _FakeEvent()
+        self.events.append(event)
+        return event
+
+    @staticmethod
+    def stream(_stream):
+        return nullcontext()
+
+
+class TestNpuSeqLensPublishPrefetch(CustomTestCase):
+    @staticmethod
+    def _future_map():
+        from sglang.srt.managers.overlap_utils import FutureMap
+
+        future_map = object.__new__(FutureMap)
+        future_map.device = torch.device("cpu")
+        future_map.new_seq_lens_buf = torch.zeros(8, dtype=torch.int64)
+        future_map.new_seq_lens_cpu_pinned = torch.full((8,), -1, dtype=torch.int64)
+        future_map.fwd_prepare_d2h_stream = _FakeCopyStream()
+        future_map.prefetch_seq_lens_cpu_on_publish = True
+        future_map.seq_lens_d2h_copy_done = None
+        future_map.seq_lens_d2h_issued = 0
+        future_map.publish_ready = None
+        future_map._publish_fresh = False
+        future_map.spec_algo = SimpleNamespace(
+            is_some=lambda: True,
+            is_dspark=lambda: True,
+        )
+        future_map.needs_cpu_seq_lens = True
+        future_map.needs_confidence_relay = False
+        return future_map
+
+    def test_publish_immediately_issues_pinned_copy(self):
+        future_map = self._future_map()
+        device_module = _FakeDeviceModule()
+        indices = torch.tensor([2, 5], dtype=torch.int64)
+
+        with patch("torch.get_device_module", return_value=device_module):
+            future_map.publish(indices, torch.tensor([11, 23], dtype=torch.int64))
+
+        self.assertEqual(future_map.seq_lens_d2h_issued, 1)
+        self.assertIsNotNone(future_map.publish_ready)
+        self.assertIsNotNone(future_map.seq_lens_d2h_copy_done)
+        self.assertEqual(future_map.publish_ready.record_count, 1)
+        self.assertEqual(future_map.seq_lens_d2h_copy_done.record_count, 1)
+        self.assertEqual(
+            future_map.fwd_prepare_d2h_stream.waited,
+            [future_map.publish_ready],
+        )
+        torch.testing.assert_close(
+            future_map.new_seq_lens_cpu_pinned,
+            future_map.new_seq_lens_buf,
+        )
+
+    def test_resolve_reuses_early_copy_without_new_d2h(self):
+        future_map = self._future_map()
+        future_map.seq_lens_d2h_issued = 1
+        future_map.publish_ready = _FakeEvent()
+        future_map.new_seq_lens_buf.copy_(
+            torch.tensor([0, 10, 20, 30, 40, 50, 60, 70], dtype=torch.int64)
+        )
+        future_map.new_seq_lens_cpu_pinned.copy_(
+            torch.tensor([0, 101, 202, 303, 404, 505, 606, 707], dtype=torch.int64)
+        )
+        batch = SimpleNamespace(
+            spec_info=SimpleNamespace(
+                future_indices=torch.tensor([2, 5], dtype=torch.int64),
+                draft_prefetch_seq_lens_cpu=None,
+            ),
+            req_pool_indices_cpu=torch.tensor([2, 5], dtype=torch.int64),
+        )
+
+        future_map.resolve_seq_lens_cpu(batch)
+
+        torch.testing.assert_close(batch.seq_lens, torch.tensor([20, 50]))
+        # Values deliberately differ from the device relay above: this proves
+        # resolve consumed the already-issued pinned snapshot.
+        torch.testing.assert_close(batch.seq_lens_cpu, torch.tensor([202, 505]))
+        self.assertEqual(batch.seq_lens_sum, 707)
+        self.assertEqual(
+            future_map.fwd_prepare_d2h_stream.synchronize_count,
+            1,
+        )
+
+    def test_device_resolve_can_precede_host_wait(self):
+        future_map = self._future_map()
+        future_map.seq_lens_d2h_issued = 1
+        future_map.publish_ready = _FakeEvent()
+        future_map.new_seq_lens_buf.copy_(
+            torch.tensor([0, 10, 20, 30, 40, 50, 60, 70], dtype=torch.int64)
+        )
+        future_map.new_seq_lens_cpu_pinned.copy_(
+            torch.tensor([0, 101, 202, 303, 404, 505, 606, 707], dtype=torch.int64)
+        )
+        batch = SimpleNamespace(
+            forward_mode=SimpleNamespace(is_decode=lambda: True),
+            is_extend_in_batch=False,
+            spec_info=SimpleNamespace(
+                future_indices=torch.tensor([2, 5], dtype=torch.int64),
+                draft_prefetch_direct=True,
+                draft_prefetch_valid_cpu=torch.tensor([True, True]),
+                draft_prefetch_seq_lens_cpu=None,
+            ),
+            req_pool_indices_cpu=torch.tensor([2, 5], dtype=torch.int64),
+        )
+
+        self.assertTrue(future_map.can_defer_seq_lens_cpu(batch))
+        from sglang.srt.environ import envs
+
+        with envs.SGLANG_DSPARK_DEFER_TARGET_METADATA.override(False):
+            self.assertFalse(future_map.can_defer_seq_lens_cpu(batch))
+        # The diagnostic switch does not disable early seq-lens publication
+        # or discard a valid prefetched proposal.
+        self.assertTrue(future_map.prefetch_seq_lens_cpu_on_publish)
+        self.assertTrue(batch.spec_info.draft_prefetch_direct)
+        self.assertTrue(future_map.resolve_seq_lens_device(batch))
+        torch.testing.assert_close(batch.seq_lens, torch.tensor([20, 50]))
+        self.assertEqual(future_map.fwd_prepare_d2h_stream.synchronize_count, 0)
+
+        future_map.resolve_seq_lens_cpu(batch, device_resolved=True)
+        torch.testing.assert_close(batch.seq_lens_cpu, torch.tensor([202, 505]))
+        self.assertEqual(batch.seq_lens_sum, 707)
+        self.assertEqual(future_map.fwd_prepare_d2h_stream.synchronize_count, 1)
+
+        batch.spec_info.draft_prefetch_valid_cpu[1] = False
+        self.assertFalse(future_map.can_defer_seq_lens_cpu(batch))
 
 
 class TestFilterBatchHostIndices(CustomTestCase):

@@ -300,6 +300,11 @@ from sglang.srt.server_args import PortArgs, ServerArgs, compute_world_size
 from sglang.srt.session.session_controller import SessionController
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_utils import validate_dflash_request
+from sglang.srt.speculative.dspark_components.dspark_diagnostics import (
+    diagnostic_stage,
+    get_diagnostics,
+    start_diagnostics,
+)
 from sglang.srt.speculative.eagle_utils import (
     get_draft_recurrent_hidden_state_spec_from_config,
 )
@@ -1752,6 +1757,7 @@ class Scheduler(
         # Triton kernel device-load is a lazy first-use at serving time.
         triton_load_watch.install()
         triton_load_watch.mark_serving_started()
+        start_diagnostics()
 
         if use_mlx():
             # MLX overlap uses mx.async_eval for CPU/GPU overlap,
@@ -1780,6 +1786,7 @@ class Scheduler(
         with self.device_module.StreamContext(self.schedule_stream):
             dispatch_event_loop(self)
 
+    @diagnostic_stage("scheduler_war")
     def _apply_war_barrier(self):
         # WAR: keep later schedule_stream writes behind this forward's shared reads.
         # Clearing matters: a phase that skips the publish then falls back to coarse.
@@ -1788,6 +1795,16 @@ class Scheduler(
         runner = self.model_worker.last_shared_read_runner
         ev = runner.shared_read_done_event
         runner.shared_read_done_event = None
+        diag = get_diagnostics()
+        if diag is not None:
+            diag.emit(
+                "war_dependency",
+                runner=id(runner),
+                event_object=id(ev) if ev is not None else None,
+                coarse=ev is None or envs.SGLANG_FORCE_COARSE_WAR_BARRIER.get(),
+                schedule_torch_stream_id=self.schedule_stream.stream_id,
+                forward_torch_stream_id=self.forward_stream.stream_id,
+            )
         if ev is not None and not envs.SGLANG_FORCE_COARSE_WAR_BARRIER.get():
             self.schedule_stream.wait_event(ev)
         else:
@@ -3191,6 +3208,7 @@ class Scheduler(
         return batch
 
     @scheduler_nvtx_method("scheduler.get_next_batch_to_run")
+    @diagnostic_stage("scheduler_plan")
     def get_next_batch_to_run(
         self, running_batch: ScheduleBatch, last_batch: Optional[ScheduleBatch]
     ) -> NextBatchPlan:
@@ -3858,6 +3876,7 @@ class Scheduler(
                 batch.sampling_info = sched_sampling_info
 
     @scheduler_nvtx_method("scheduler.run_batch")
+    @diagnostic_stage("scheduler_run")
     def run_batch(
         self,
         batch: ScheduleBatch,
@@ -3893,7 +3912,29 @@ class Scheduler(
             if self.enable_overlap:
                 # Self-gates on batch.spec_info.future_indices; non-spec_v2
                 # no-ops (ForwardBatch.init_new lazily computes the sum).
-                self.future_map.resolve_seq_lens_cpu(batch)
+                deferred_seq_lens_cpu_resolver = None
+                if self.future_map.can_defer_seq_lens_cpu(batch):
+                    # DSPark's direct proposal and verify-window are already on
+                    # device. Resolve the device relay now, but let the target
+                    # graph consume the exact pinned CPU mirror only after its
+                    # pointer-stable input/attention preparation is enqueued.
+                    # This moves no model math and preserves the legacy path for
+                    # bootstrap, mixed, filtered and proposer-fallback rounds.
+                    if self.future_map.resolve_seq_lens_device(batch):
+                        # prepare_for_verify replaces batch.spec_info before
+                        # the graph invokes this callback.  Retain the
+                        # producing DraftInput so its FutureMap row mapping
+                        # remains available without restoring mutable batch
+                        # state in the middle of target replay.
+                        relay_input = batch.spec_info
+                        deferred_seq_lens_cpu_resolver = partial(
+                            self.future_map.resolve_seq_lens_cpu,
+                            batch,
+                            device_resolved=True,
+                            relay_input=relay_input,
+                        )
+                else:
+                    self.future_map.resolve_seq_lens_cpu(batch)
                 if self._confidence_budget_prepare is not None:
                     self._confidence_budget_prepare(batch, self.future_map)
 
@@ -3916,6 +3957,12 @@ class Scheduler(
                             fwd_kwargs["on_publish"] = partial(
                                 self.future_map.publish, future_indices
                             )
+                            if deferred_seq_lens_cpu_resolver is not None:
+                                # Only DSpark advertises the direct-prefetch
+                                # deferral predicate above and accepts this hook.
+                                fwd_kwargs["seq_lens_cpu_resolver"] = (
+                                    deferred_seq_lens_cpu_resolver
+                                )
                             # Grammar-overlap-capable workers advance the grammar FSM
                             # inside verify() before building the bitmask; hand them the
                             # barrier that resolves the previous batch's committed
@@ -4649,6 +4696,18 @@ class Scheduler(
         if self.spec_algorithm.is_dspark() and self.draft_worker is not None:
             info_record = self.draft_worker.dump_info_records()
             if info_record is not None:
+                prefetch_info = info_record.get("draft_prefetch")
+                if isinstance(prefetch_info, dict):
+                    prefetch_info["early_seq_lens_d2h"] = bool(
+                        getattr(
+                            self.future_map,
+                            "prefetch_seq_lens_cpu_on_publish",
+                            False,
+                        )
+                    )
+                    prefetch_info["seq_lens_d2h_issued"] = int(
+                        getattr(self.future_map, "seq_lens_d2h_issued", 0)
+                    )
                 ret["dspark_info_record"] = info_record
 
         if envs.SGLANG_EXPOSE_OWN_ENV_VARS.get():

@@ -645,9 +645,23 @@ def build_decode_registry(
     if enable_num_token_non_padded:
         from sglang.srt.model_executor.forward_batch_info import (
             compute_local_num_token_non_padded,
+            compute_local_num_token_non_padded_cpu,
         )
 
         def _num_token_non_padded_post_fill(buf, fb, ctx):
+            if fb.num_token_non_padded is None:
+                if fb.num_token_non_padded_cpu is None:
+                    raise RuntimeError(
+                        "decode graph requires num_token_non_padded device or CPU metadata"
+                    )
+                value = int(fb.num_token_non_padded_cpu)
+                if require_gathered_buffer and not enable_prefill_cp:
+                    value = compute_local_num_token_non_padded_cpu(
+                        global_num_token_non_padded=value,
+                        num_tokens_per_dp=ctx.padded_num_tokens,
+                    )
+                buf.fill_(value)
+                return
             # Gathered (DP) path overwrites the plain FB copy with this rank's
             # local count; the non-gathered path keeps the copied value.
             if require_gathered_buffer and not enable_prefill_cp:

@@ -32,6 +32,7 @@ from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, Forw
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import apply_dflash_verify_logits_adjustments
+from sglang.srt.speculative.dspark_components.dspark_diagnostics import diagnostic_stage
 from sglang.srt.speculative.dspark_components.dspark_draft import DraftBlockResult
 from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
     TargetHiddenKvInjector,
@@ -103,6 +104,7 @@ class TargetVerifyExecutor:
         self._simulate_acc_len = float(simulate_acc_len)
         self._simulated_correct_drafts_buf: Optional[torch.Tensor] = None
 
+    @diagnostic_stage("accept", device=True)
     def accept_and_finalize(
         self,
         *,
@@ -190,6 +192,7 @@ class TargetVerifyExecutor:
         )
         return buf[:bs].fill_(simulated_acc_len - 1)
 
+    @diagnostic_stage("target_idle", device=True)
     def run_idle_participation(
         self,
         *,
@@ -249,10 +252,30 @@ class TargetVerifyExecutor:
         verify_ids_2d: torch.Tensor,
         verify_window: VerifyWindow,
         sampling_info,
+        seq_lens_cpu_resolver=None,
     ) -> TargetVerifyResult:
         verify_w = self.verify_num_draft_tokens
         positions_2d = verify_window.positions_2d
         verify_cache_loc = verify_window.verify_cache_loc
+
+        seq_lens_cpu_backup = batch.seq_lens_cpu
+        seq_lens_sum_backup = batch.seq_lens_sum
+        deferred_upper_bound = None
+        if seq_lens_cpu_resolver is not None:
+            # nxt_kv_lens_cpu is the page-aligned allocation boundary produced
+            # by prepare_for_decode. It is safe for block-table preparation but
+            # is never exposed to FIA as the logical sequence length: the
+            # ForwardBatch resolver below replaces it with exact post-accept
+            # lengths immediately before graph.update/replay.
+            deferred_upper_bound = draft_input.nxt_kv_lens_cpu
+            if deferred_upper_bound is None:
+                seq_lens_cpu_resolver()
+                seq_lens_cpu_resolver = None
+                seq_lens_cpu_backup = batch.seq_lens_cpu
+                seq_lens_sum_backup = batch.seq_lens_sum
+            else:
+                batch.seq_lens_cpu = deferred_upper_bound
+                batch.seq_lens_sum = int(deferred_upper_bound.sum())
 
         verify_input = DFlashVerifyInput(
             draft_token=verify_ids_2d.reshape(-1),
@@ -260,12 +283,16 @@ class TargetVerifyExecutor:
             draft_token_num=verify_w,
             custom_mask=None,
             capture_hidden_mode=CaptureHiddenMode.FULL,
-            live_seq_lens_cpu=batch.seq_lens_cpu,
+            # DSV4 is excluded from deferred staging by the caller.  On the
+            # K3 path this field is unused; do not mislabel the allocation
+            # upper bound as an exact live length.
+            live_seq_lens_cpu=(
+                batch.seq_lens_cpu if seq_lens_cpu_resolver is None else None
+            ),
         )
         batch.out_cache_loc = verify_cache_loc
-        seq_lens_cpu_backup = batch.seq_lens_cpu
-        seq_lens_sum_backup = batch.seq_lens_sum
-        if not self._verify_backend_self_adds_seq_lens():
+        backend_self_adds = self._verify_backend_self_adds_seq_lens()
+        if seq_lens_cpu_resolver is None and not backend_self_adds:
             if seq_lens_cpu_backup is not None:
                 batch.seq_lens_cpu = seq_lens_cpu_backup + verify_w
                 batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
@@ -278,6 +305,9 @@ class TargetVerifyExecutor:
             verify_input=verify_input,
             seq_lens_cpu_backup=seq_lens_cpu_backup,
             seq_lens_sum_backup=seq_lens_sum_backup,
+            seq_lens_cpu_resolver=seq_lens_cpu_resolver,
+            seq_lens_cpu_upper_bound=deferred_upper_bound,
+            resolved_seq_lens_offset=(0 if backend_self_adds else verify_w),
         )
 
         if sampling_info is not None:
@@ -289,6 +319,7 @@ class TargetVerifyExecutor:
 
         return result
 
+    @diagnostic_stage("target_verify", device=True)
     def _forward_prepared_verify(
         self,
         *,
@@ -296,25 +327,53 @@ class TargetVerifyExecutor:
         verify_input: DFlashVerifyInput,
         seq_lens_cpu_backup,
         seq_lens_sum_backup,
+        seq_lens_cpu_resolver=None,
+        seq_lens_cpu_upper_bound=None,
+        resolved_seq_lens_offset: int = 0,
     ) -> TargetVerifyResult:
         verify_forward_batch, _ = verify_input.prepare_for_verify(
             batch, self.target_worker
         )
+
+        if seq_lens_cpu_resolver is not None:
+
+            def resolve_target_seq_lens_cpu():
+                seq_lens_cpu_resolver()
+                exact_live = batch.seq_lens_cpu
+                if exact_live is None:
+                    raise RuntimeError(
+                        "Deferred DSPark target preparation did not produce "
+                        "seq_lens_cpu."
+                    )
+                exact_target = exact_live + resolved_seq_lens_offset
+                return exact_target, int(exact_target.sum())
+
+            verify_forward_batch.deferred_seq_lens_cpu_resolver = (
+                resolve_target_seq_lens_cpu
+            )
+            verify_forward_batch.seq_lens_cpu_upper_bound = seq_lens_cpu_upper_bound
+
         batch.seq_lens_cpu = seq_lens_cpu_backup
         batch.seq_lens_sum = seq_lens_sum_backup
-
-        target_out = self.target_worker.forward_batch_generation(
-            batch=None,
-            forward_batch=verify_forward_batch,
-            is_verify=True,
-            skip_attn_backend_init=True if not _is_npu else None,
-        )
+        try:
+            target_out = self.target_worker.forward_batch_generation(
+                batch=None,
+                forward_batch=verify_forward_batch,
+                is_verify=True,
+                skip_attn_backend_init=True if not _is_npu else None,
+            )
+        finally:
+            # The resolver mutates ScheduleBatch only as a bridge to FutureMap;
+            # preserve the worker's pre-existing save/restore contract.
+            batch.seq_lens_cpu = seq_lens_cpu_backup
+            batch.seq_lens_sum = seq_lens_sum_backup
         return TargetVerifyResult(
             logits_output=target_out.logits_output,
             can_run_cuda_graph=target_out.can_run_cuda_graph,
             expert_distribution_metrics=target_out.expert_distribution_metrics,
         )
 
+    @diagnostic_stage("commit_hidden", device=True)
     def commit_hidden(
         self,
         *,
@@ -397,6 +456,7 @@ class TargetVerifyExecutor:
             seq_lens_sum_backup=seq_lens_sum_backup,
         )
 
+    @diagnostic_stage("target_verify_compact", device=True)
     def run_compact(
         self,
         *,

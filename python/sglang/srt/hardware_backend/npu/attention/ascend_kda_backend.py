@@ -2,26 +2,17 @@ import math
 from typing import Optional
 
 import torch
+
 # from sgl_kernel_npu.fla.kda_chunk_delta_h import (
 #     chunk_gated_delta_rule_fwd_h_npu,
 # )
 from sgl_kernel_npu.fla.kda_gate import fused_kda_gate_npu
+
 # from sgl_kernel_npu.fla.kda_prefill import (
 #     chunk_gla_fwd_o_gk_npu,
 #     recompute_w_u_fwd_npu,
 # )
 from sgl_kernel_npu.fla.kda_target_verify import kda_target_verify_npu
-# from sgl_kernel_npu.fla.solve_tril import solve_tril_npu
-# from sgl_kernel_npu.fla.utils import prepare_chunk_indices
-from sgl_kernel_npu.mamba.causal_conv1d import (
-    causal_conv1d_fn_npu,
-    causal_conv1d_update_npu,
-)
-from sgl_kernel_npu.mamba.causal_conv1d_verify import (
-    causal_conv1d_linear_verify_npu,
-)
-from sgl_kernel_npu.fla.solve_tril import solve_tril_npu
-from sgl_kernel_npu.fla.utils import prepare_chunk_indices
 
 # from cann_ops_transformer.ops import chunk_kda_fwd
 # from sglang.kernels.ops.attention.fla.cumsum import chunk_local_cumsum
@@ -33,6 +24,10 @@ from sglang.srt.layers.attention.linear.kda_backend import (
 )
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+# from sgl_kernel_npu.fla.solve_tril import solve_tril_npu
+# from sgl_kernel_npu.fla.utils import prepare_chunk_indices
+
 
 _LOG2_E = math.log2(math.e)
 
@@ -77,11 +72,7 @@ class _AscendKDAExtendKernel:
             .contiguous()
         )
         scale = k.shape[-1] ** -0.5
-        query_start_loc = (
-            query_start_loc
-            .to(dtype=torch.int64)
-            .contiguous()
-        )
+        query_start_loc = query_start_loc.to(dtype=torch.int64).contiguous()
 
         outputs = torch.ops.npu.chunk_kda_fwd(
             q,
@@ -373,6 +364,20 @@ class AscendKDAAttnBackend(KDAAttnBackend):
         query_start_loc = metadata.query_start_loc
         cache_indices = metadata.mamba_cache_indices
 
+        draft_token_num = forward_batch.spec_info.draft_token_num
+        batch_size = query_start_loc.shape[0] - 1
+        if batch_size == 0:
+            if seq_len != 0:
+                raise RuntimeError(
+                    "Ascend KDA target verify received tokens for an empty batch: "
+                    f"seq_len={seq_len}."
+                )
+            # DP-attention idle ranks must still walk the model so they can join
+            # the busy ranks' MoE collectives.  No recurrent/conv state belongs
+            # to this rank, so avoid submitting zero-size KDA kernels and return
+            # the normal attention shape with an empty token dimension.
+            return mixed_qkv.new_empty((1, 0, layer.num_v_heads, layer.head_v_dim))
+
         cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
         intermediate_state = cache.intermediate_ssm
         if intermediate_state is None:
@@ -380,8 +385,6 @@ class AscendKDAAttnBackend(KDAAttnBackend):
                 "Ascend KDA target verify requires speculative Mamba scratch."
             )
 
-        draft_token_num = forward_batch.spec_info.draft_token_num
-        batch_size = query_start_loc.shape[0] - 1
         num_dense_tokens = batch_size * draft_token_num
         ragged_layout = forward_batch.spec_info.ragged_verify_layout
         if ragged_layout is None and seq_len == num_dense_tokens:

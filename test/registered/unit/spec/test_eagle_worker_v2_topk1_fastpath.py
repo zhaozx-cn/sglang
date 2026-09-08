@@ -161,6 +161,135 @@ class TestEagleWorkerV2Topk1FastPath(CustomTestCase):
         self.assertEqual(worker.draft_runner.forward.call_count, 2)
 
 
+class TestEagleDraftPrefetch(CustomTestCase):
+    def setUp(self):
+        override = get_context().override_server_args(
+            enable_draft_prefetch=True,
+            skip_draft_prefetch_seq_lens_cpu_sync=False,
+        )
+        override.install()
+        self.addCleanup(override.restore)
+
+    def test_prefill_seed_is_repeated_to_fixed_chain_width(self):
+        worker = object.__new__(EagleDraftWorker)
+        worker.enable_draft_prefetch = True
+        worker.speculative_num_steps = 4
+        worker.topk = 1
+        worker.hot_token_id = None
+
+        probabilities = torch.tensor([[0.8], [0.6]], device=DEVICE)
+        indices = torch.tensor([[5], [7]], device=DEVICE)
+        padded_p, padded_i = worker._pad_topk_for_draft_prefetch(probabilities, indices)
+
+        self.assertTrue(torch.allclose(padded_p, probabilities.expand(-1, 4)))
+        self.assertEqual(padded_i.tolist(), [[5] * 4, [7] * 4])
+
+    def test_prefetched_chain_builds_verify_without_draft_forward(self):
+        worker = object.__new__(EagleDraftWorker)
+        worker.topk = 1
+        worker.speculative_num_steps = 3
+        worker.speculative_num_draft_tokens = 4
+        worker.device = DEVICE
+        worker.target_worker = object()
+        worker.tree_mask_mode = object()
+        draft_input = SimpleNamespace(
+            topk_p=torch.ones((2, 3), device=DEVICE),
+            topk_index=torch.tensor([[5, 50, 51], [6, 60, 61]], device=DEVICE),
+        )
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.DECODE,
+            spec_info=draft_input,
+        )
+        sentinel = object()
+
+        with patch(
+            "sglang.srt.speculative.eagle_worker_v2.build_eagle_verify_input",
+            return_value=sentinel,
+        ) as build_verify:
+            result = worker.prepare_verify_from_draft_prefetch(batch)
+
+        self.assertIs(result, sentinel)
+        parent_list = build_verify.call_args.args[2]
+        selected_index = build_verify.call_args.args[3]
+        draft_tokens = build_verify.call_args.args[4]
+        self.assertEqual(parent_list.tolist(), [[-1, 0, 1], [-1, 0, 1]])
+        self.assertEqual(selected_index.tolist(), [[0, 1, 2], [0, 1, 2]])
+        self.assertEqual(draft_tokens.tolist(), [[5, 50, 51], [6, 60, 61]])
+        self.assertIsNone(build_verify.call_args.args[5])
+
+    def test_draft_prefetch_concatenates_next_round_chain(self):
+        worker = object.__new__(EagleDraftWorker)
+        worker.req_to_token_pool = object()
+        worker.cuda_graph_runner = SimpleNamespace(
+            execute=MagicMock(
+                return_value=(
+                    None,
+                    None,
+                    torch.tensor([[5, 50, 51], [6, 60, 61]], device=DEVICE),
+                    None,
+                )
+            )
+        )
+        worker.draft_runner = object()
+        worker.draft_attn_backend = SimpleNamespace(needs_cpu_seq_lens=True)
+        worker.topk = 1
+        worker.speculative_num_steps = 3
+        worker.hot_token_id = None
+
+        original_spec = object()
+        original_input = torch.tensor([1, 2], device=DEVICE)
+        original_seq_lens = torch.tensor([10, 20], dtype=torch.int32, device=DEVICE)
+        original_seq_lens_cpu = original_seq_lens.cpu()
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.DRAFT_EXTEND_V2,
+            seq_lens=original_seq_lens,
+            seq_lens_cpu=original_seq_lens_cpu,
+            seq_lens_sum=30,
+            spec_info=original_spec,
+            input_ids=original_input,
+            device=DEVICE,
+        )
+        next_input = SimpleNamespace(
+            topk_p=torch.ones((2, 1), device=DEVICE),
+            topk_index=torch.tensor([[5], [6]], device=DEVICE),
+        )
+        result = SimpleNamespace(
+            next_draft_input=next_input,
+            new_seq_lens=torch.tensor([12, 23], dtype=torch.int32, device=DEVICE),
+        )
+        observed = {}
+
+        def fake_prepare(*args):
+            prepared_batch = args[2]
+            observed["mode"] = prepared_batch.forward_mode
+            observed["seq_lens"] = prepared_batch.seq_lens.clone()
+            observed["seq_lens_cpu"] = prepared_batch.seq_lens_cpu.clone()
+            return SimpleNamespace(), True
+
+        with (
+            patch(
+                "sglang.srt.speculative.eagle_worker_v2.prepare_for_draft",
+                side_effect=fake_prepare,
+            ),
+            patch(
+                "sglang.srt.speculative.eagle_worker_v2.spec_stage_span",
+                return_value=contextlib.nullcontext(),
+            ),
+        ):
+            worker.draft_prefetch(batch, result)
+
+        self.assertEqual(observed["mode"], ForwardMode.DECODE)
+        self.assertEqual(observed["seq_lens"].tolist(), [12, 23])
+        self.assertEqual(observed["seq_lens_cpu"].tolist(), [12, 23])
+        self.assertEqual(next_input.topk_index.tolist(), [[5, 50, 51], [6, 60, 61]])
+        self.assertEqual(next_input.topk_p.tolist(), [[1.0] * 3, [1.0] * 3])
+        self.assertIs(batch.spec_info, original_spec)
+        self.assertIs(batch.input_ids, original_input)
+        self.assertIs(batch.seq_lens, original_seq_lens)
+        self.assertIs(batch.seq_lens_cpu, original_seq_lens_cpu)
+        self.assertEqual(batch.seq_lens_sum, 30)
+
+
 class TestEagleWorkerV2BackendFallback(CustomTestCase):
     def setUp(self):
         # The adaptive state-machine paths write live spec switches through

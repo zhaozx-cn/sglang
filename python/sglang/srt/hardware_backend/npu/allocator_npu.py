@@ -41,11 +41,19 @@ class NPUPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
             )
 
         if num_new_pages is None:
-            num_new_pages_tensor = (
-                (seq_lens + self.roundup) // self.page_size
-                - (prefix_lens + self.roundup) // self.page_size
-            ).sum()
-            num_new_pages_item = num_new_pages_tensor.item()
+            # Page accounting is scheduler metadata and already has an exact
+            # CPU mirror.  Reading the equivalent NPU expression with item()
+            # synchronizes the current stream.  During a DP-attention
+            # prefill->decode transition that stream can still contain the
+            # previous forward, while idle DP ranks are waiting for this rank
+            # in the next scheduler Gloo gather, creating a circular wait.
+            # Keep allocation accounting on CPU, like alloc_decode and the
+            # generic paged allocator do.
+            num_new_pages_item = get_num_new_pages(
+                seq_lens=seq_lens_cpu,
+                page_size=self.page_size,
+                prefix_lens=prefix_lens_cpu,
+            )
         else:
             num_new_pages_item = num_new_pages
         if self.need_sort and num_new_pages_item > len(self.free_pages):

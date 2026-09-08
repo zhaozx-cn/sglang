@@ -3307,6 +3307,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if keep_indices is None or len(keep_indices) == 0:
             # Filter out all requests. Stale tensors are left as-is: is_empty()
             # keys off reqs, so callers drop the batch before a forward reads them.
+            if self.spec_info is not None:
+                discard_prefetch = getattr(
+                    self.spec_info, "discard_draft_prefetch", None
+                )
+                if discard_prefetch is not None:
+                    # No consumer remains to publish the scheduler-side plan.
+                    # Release a waiting DSPARK prefetch as cancelled without
+                    # blocking the scheduler on a result that will be dropped.
+                    discard_prefetch()
             self.reqs = []
             self.return_hidden_states = False
             self.return_hidden_states_mode = CaptureHiddenMode.NULL

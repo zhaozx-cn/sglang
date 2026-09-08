@@ -43,8 +43,14 @@ from sglang.srt.speculative.dspark_components.dspark_config import (
     draft_is_deepseek_v4,
     resolve_runtime_config,
 )
+from sglang.srt.speculative.dspark_components.dspark_diagnostics import (
+    configure_diagnostics,
+    diagnostic_stage,
+)
 from sglang.srt.speculative.dspark_components.dspark_draft import (
     DraftBlockProposer,
+    DraftBlockResult,
+    DraftProposal,
     make_next_draft_input,
 )
 from sglang.srt.speculative.dspark_components.dspark_draft_sampler import (
@@ -59,6 +65,7 @@ from sglang.srt.speculative.dspark_components.dspark_observability import (
 )
 from sglang.srt.speculative.dspark_components.dspark_planner import (
     DSparkVerifyPlanner,
+    VerifyWindow,
     alloc_verify_window,
     dp_global_verify_tier_num_tokens,
     idle_ragged_layout,
@@ -75,6 +82,7 @@ from sglang.srt.speculative.spec_utils import (
     build_grammar_vocab_mask,
     draft_tp_context,
     prepare_mamba_track_for_verify,
+    spec_stage_span,
 )
 from sglang.srt.utils import (
     is_cuda,
@@ -85,11 +93,8 @@ from sglang.srt.utils import (
 
 logger = logging.getLogger(__name__)
 
-_is_npu = is_npu()
-
 
 class DSparkWorkerV2(BaseSpecWorker):
-
     def __init__(
         self,
         server_args: ServerArgs,
@@ -147,6 +152,12 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.draft_model_runner = bundle.draft_model_runner
         self.draft_model = bundle.draft_model
         self._draft_sampler = None
+        # Updated for every forward according to the phase that actually ran
+        # last.  This cannot be derived from the feature flag: idle ranks and
+        # fallback rounds do not execute the post-verify draft prefetch.
+        self._last_shared_read_runner = self.model_runner
+
+        configure_diagnostics(self.device, tp_rank=ps.tp_rank, dp_rank=ps.attn_dp_rank)
 
         # The mask token is input-only (it is embedded, never sampled), so its
         # bound is the embedding-table row count: the PADDED vocab when the
@@ -174,6 +185,23 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.query_token_num = self.gamma if self.sample_from_anchor else self.gamma + 1
         self.speculative_num_draft_tokens = self.verify_num_draft_tokens
         self._mask_token_id = runtime_config.mask_token_id
+        self.enable_draft_prefetch = bool(get_spec().enable_draft_prefetch)
+        self._draft_prefetch_stats = {
+            "produced": 0,
+            "consumed": 0,
+            "consume_miss": 0,
+            "skipped_non_greedy": 0,
+            "target_prep_deferred": 0,
+            "target_prep_sync_fallback": 0,
+        }
+        self._draft_prefetch_greedy_mask = None
+        self._draft_prefetch_temperatures = None
+        # The Ascend DSPark draft backend consumes device seq_lens directly.
+        # Prefetch therefore stays on the forward stream: no blocking D2H,
+        # Future.result, cross-stream event, or Gloo/plan handoff is needed.
+        self._draft_prefetch_async = False
+        # Attention backends are initialized in a later startup phase.
+        self._draft_prefetch_device_seq_lens = False
 
         parallel = get_parallel()
         self._tp_sync = SpecTpSync(
@@ -352,6 +380,17 @@ class DSparkWorkerV2(BaseSpecWorker):
             self.draft_model_runner.attn_backend,
         )
 
+    @property
+    def last_shared_read_runner(self):
+        # The scheduler's next allocation can mutate the shared req_to_token
+        # table. A successful prefetched Draft ACLGraph replay reads that table
+        # after Target has finished, so its POST_REPLAY event—not Target's
+        # earlier event—is the only sound WAR boundary.  Keeping only a narrow
+        # draft-input reuse fence is insufficient: req_to_token would still be
+        # read and written concurrently and can feed an invalid DDR address to
+        # cache_loc/FIA kernels.
+        return self._last_shared_read_runner
+
     def __getattr__(self, name):
         if name == "_target_worker":
             raise AttributeError(name)
@@ -361,6 +400,21 @@ class DSparkWorkerV2(BaseSpecWorker):
         if self._draft_dp_context_enabled:
             return draft_tp_context(get_parallel().attn_tp_group)
         return nullcontext()
+
+    @diagnostic_stage("draft_buffer_wait")
+    def _wait_for_previous_draft_read(self) -> None:
+        """Secondary guard for direct/non-scheduler draft-buffer reuse.
+
+        The overlap scheduler normally consumes this event through
+        ``last_shared_read_runner`` before it mutates shared allocation state.
+        Retain this local guard for fallback/idle paths and direct worker calls
+        that can reach a new proposal without passing that scheduler boundary.
+        """
+        read_done = getattr(self.draft_model_runner, "shared_read_done_event", None)
+        if read_done is None:
+            return
+        self.draft_model_runner.shared_read_done_event = None
+        torch.get_device_module(self.device).current_stream().wait_event(read_done)
 
     def alloc_memory_pool(
         self,
@@ -377,6 +431,13 @@ class DSparkWorkerV2(BaseSpecWorker):
     def init_attention_backends(self):
         with self._draft_context():
             self._draft_worker.init_attention_backends()
+        self._draft_prefetch_device_seq_lens = is_npu() and bool(
+            getattr(
+                self.draft_model_runner.attn_backend,
+                "use_dspark_device_verify",
+                False,
+            )
+        )
         self._need_mamba_verify_commit = mambaish_config(
             self.model_runner.model_config
         ) is not None and hasattr(
@@ -420,6 +481,15 @@ class DSparkWorkerV2(BaseSpecWorker):
             self._draft_worker.init_cuda_graphs(
                 capture_decode_cuda_graph=capture_decode_cuda_graph
             )
+        # Device sequence lengths are valid only when the draft runner really
+        # captured a device-length ACLGraph. If graph capture was disabled for low
+        # memory, retain the functional host-metadata prefetch fallback.
+        draft_graph_runner = self.draft_model_runner.decode_cuda_graph_runner
+        self._draft_prefetch_device_seq_lens = bool(
+            is_npu()
+            and draft_graph_runner is not None
+            and getattr(draft_graph_runner, "use_dspark_device_seq_lens", False)
+        )
 
     def _maybe_build_draft_sampler(self, *, available_memory_gb: float):
         return maybe_build_draft_sampler(
@@ -450,10 +520,25 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._verify_planner.set_forced_budget_frac(frac)
 
     def dump_info_records(self) -> Optional[dict]:
-        return self._observers.dump_info_records()
+        dumped = self._observers.dump_info_records() or {}
+        dumped["draft_prefetch"] = {
+            "enabled": self.enable_draft_prefetch,
+            "async_npu": self._draft_prefetch_async,
+            "same_stream": True,
+            "device_seq_lens": self._draft_prefetch_device_seq_lens,
+            "deferred_graph_metadata_h2d": bool(
+                self.enable_draft_prefetch
+                and self._draft_prefetch_device_seq_lens
+                and envs.SGLANG_DSPARK_DEFER_TARGET_METADATA.get()
+            ),
+            **self._draft_prefetch_stats,
+        }
+        return dumped
 
     def clear_info_records(self) -> None:
         self._observers.clear_info_records()
+        for key in self._draft_prefetch_stats:
+            self._draft_prefetch_stats[key] = 0
 
     def block_accept_estimate_log_suffix(self) -> Optional[str]:
         return self._observers.block_accept_estimate_log_suffix()
@@ -461,19 +546,41 @@ class DSparkWorkerV2(BaseSpecWorker):
     def note_request_finished(self, *, rid: str, natural_stop: bool) -> None:
         self._observers.note_request_finished(rid=rid, natural_stop=natural_stop)
 
+    @diagnostic_stage("worker_forward", device=True, iteration=True)
     def forward_batch_generation(
         self,
         batch: ScheduleBatch,
         on_publish=None,
         grammar_barrier=None,
+        seq_lens_cpu_resolver=None,
     ) -> GenerationBatchResult:
+        # Safe default for prefill, idle decode, and every prefetch fallback.
+        # _schedule_draft_prefetch switches this only after it really enqueues
+        # a post-verify draft graph.
+        self._last_shared_read_runner = self.model_runner
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             self._verify_planner.note_non_decode_step()
             self._observers.note_prefill_step()
-            return self._forward_prefill(batch, on_publish)
+            result = self._forward_prefill(batch, on_publish)
+        else:
+            result = self._forward_decode(
+                batch,
+                on_publish,
+                grammar_barrier,
+                seq_lens_cpu_resolver=seq_lens_cpu_resolver,
+            )
+        if (
+            is_npu()
+            and self.enable_draft_prefetch
+            and self._last_shared_read_runner is self.model_runner
+        ):
+            # A target-graph event does not cover the worker's later KV
+            # injection/accept-commit reads. Without a successful prefetch,
+            # retain the scheduler's whole-forward fence for these paths.
+            self.model_runner.shared_read_done_event = None
+        return result
 
-        return self._forward_decode(batch, on_publish, grammar_barrier)
-
+    @diagnostic_stage("target_prefill_and_inject", device=True)
     def _forward_prefill(
         self, batch: ScheduleBatch, on_publish
     ) -> GenerationBatchResult:
@@ -599,8 +706,257 @@ class DSparkWorkerV2(BaseSpecWorker):
             new_seq_lens=next_draft_input.new_seq_lens,
         )
 
+    def _proposal_from_draft_prefetch(
+        self,
+        *,
+        draft_input: DFlashDraftInputV2,
+        sampling_info,
+    ) -> Optional[DraftProposal]:
+        """Consume the fixed-width DSpark block relayed from the prior round."""
+        if not self.enable_draft_prefetch:
+            return None
+        if sampling_info is not None and not sampling_info.is_all_greedy:
+            self._draft_prefetch_stats["consume_miss"] += 1
+            return None
+        if (
+            draft_input.topk_p.ndim != 2
+            or draft_input.topk_index.ndim != 2
+            or draft_input.topk_p.shape[1] != self.verify_num_draft_tokens
+            or draft_input.topk_index.shape[1] != self.verify_num_draft_tokens
+        ):
+            self._draft_prefetch_stats["consume_miss"] += 1
+            return None
+        # Prefill and any mixed batch row without a prefetched block carry a
+        # false host-side validity bit. Fall back for the whole batch so all
+        # TP/DP ranks make the same draft-forward decision. Do not inspect the
+        # device topk tensor with .item(): that would serialize every decode.
+        valid_cpu = draft_input.draft_prefetch_valid_cpu
+        if valid_cpu is None or not bool(torch.all(valid_cpu)):
+            self._draft_prefetch_stats["consume_miss"] += 1
+            return None
+
+        verify_ids_2d = draft_input.topk_index
+        bs = int(verify_ids_2d.shape[0])
+        draft_tokens = verify_ids_2d[:, 1:]
+        confidence = (
+            draft_input.topk_p[:, 1:]
+            if self._verify_planner.carries_confidence
+            else None
+        )
+        greedy_mask = self.__dict__.get("_draft_prefetch_greedy_mask")
+        temperatures = self.__dict__.get("_draft_prefetch_temperatures")
+        if greedy_mask is None or greedy_mask.numel() < bs:
+            capacity = max(
+                bs, 32, 0 if greedy_mask is None else greedy_mask.numel() * 2
+            )
+            greedy_mask = torch.ones(capacity, dtype=torch.bool, device=self.device)
+            temperatures = torch.ones(capacity, dtype=torch.float32, device=self.device)
+            self._draft_prefetch_greedy_mask = greedy_mask
+            self._draft_prefetch_temperatures = temperatures
+        proposal = DraftProposal(
+            draft_block_ids=verify_ids_2d[:, :1],
+            draft_block=DraftBlockResult(
+                draft_tokens=draft_tokens,
+                corrected_logits=None,
+                greedy_mask=greedy_mask[:bs],
+                temperatures=temperatures[:bs],
+            ),
+            draft_hidden=None,
+            confidence=confidence,
+            confidence_tap=None,
+            # The prefetched token block is correct for graph and eager verify,
+            # but folded accept owns separate capture-time buffers. Keep accept
+            # eager until those buffers are explicitly relayed as well.
+            folded=False,
+        )
+        self._draft_prefetch_stats["consumed"] += 1
+        return proposal
+
+    def _verify_window_from_draft_prefetch(
+        self, *, draft_input: DFlashDraftInputV2, bs: int
+    ) -> Optional[VerifyWindow]:
+        positions_2d = draft_input.draft_prefetch_positions_2d
+        cache_loc_2d = draft_input.draft_prefetch_verify_cache_loc_2d
+        expected = (bs, self.verify_num_draft_tokens)
+        if (
+            positions_2d is None
+            or cache_loc_2d is None
+            or tuple(positions_2d.shape) != expected
+            or tuple(cache_loc_2d.shape) != expected
+        ):
+            return None
+        return VerifyWindow(
+            positions_2d=positions_2d,
+            verify_cache_loc=cache_loc_2d.reshape(-1),
+            verify_cache_loc_2d=cache_loc_2d,
+        )
+
+    def _draft_prefetch_next(
+        self,
+        *,
+        batch: ScheduleBatch,
+        next_draft_input: DFlashDraftInputV2,
+        new_seq_lens: torch.Tensor,
+        block_table_bound_cpu: Optional[torch.Tensor],
+        target_model,
+        sampling_info,
+    ) -> bool:
+        """Pre-run the next DSpark proposal and publish it in next_draft_input."""
+        if not self.enable_draft_prefetch:
+            return False
+        # Draft sampling needs corrected logits/probabilities in the next
+        # accept step. The first functional path prefetches greedy requests and
+        # leaves sampling requests on the existing proposal path.
+        if sampling_info is not None and not sampling_info.is_all_greedy:
+            self._draft_prefetch_stats["skipped_non_greedy"] += 1
+            return False
+
+        original_seq_lens = batch.seq_lens
+        original_seq_lens_cpu = batch.seq_lens_cpu
+        original_seq_lens_sum = batch.seq_lens_sum
+        original_spec_info = batch.spec_info
+        original_out_cache_loc = batch.out_cache_loc
+        try:
+            if next_draft_input.draft_prefetch_cancelled:
+                return False
+            if self._draft_prefetch_device_seq_lens and block_table_bound_cpu is None:
+                # Bootstrap/mixed batches without scheduler over-allocation do
+                # not have a safe device-only window yet. Fall back next round
+                # instead of introducing a D2H on the critical path.
+                return False
+            batch.seq_lens = new_seq_lens
+            if self._draft_prefetch_device_seq_lens:
+                batch.seq_lens_cpu = block_table_bound_cpu
+                # The CPU tensor is an allocation bound, not an exact logical
+                # length. Keep the sum absent so no downstream path mistakes it
+                # for sum(device seq_lens).
+                batch.seq_lens_sum = None
+                next_draft_input.draft_prefetch_block_table_bound_cpu = (
+                    block_table_bound_cpu
+                )
+            else:
+                batch.seq_lens_cpu = new_seq_lens.to("cpu")
+                batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+                next_draft_input.draft_prefetch_seq_lens_cpu = batch.seq_lens_cpu
+            batch.spec_info = next_draft_input
+
+            bs = int(new_seq_lens.numel())
+            verify_window = alloc_verify_window(
+                batch=batch,
+                bs=bs,
+                device=self.device,
+                verify_num_draft_tokens=self.verify_num_draft_tokens,
+                block_pos_offsets=self._block_pos_offsets,
+                model_runner=self.model_runner,
+            )
+            with self._draft_context(), spec_stage_span("draft_prefetch"):
+                proposal = self._proposer.propose(
+                    batch=batch,
+                    draft_input=next_draft_input,
+                    verify_window=verify_window,
+                    bs=bs,
+                    device=self.device,
+                    target_model=target_model,
+                    sampling_info=sampling_info,
+                )
+
+            confidence = proposal.confidence
+            if confidence is None:
+                confidence = self._verify_planner.compute_confidence_tensor(
+                    draft_hidden=proposal.draft_hidden,
+                    anchor_tokens=proposal.draft_block_ids[:, 0],
+                    draft_tokens=proposal.draft_block.draft_tokens,
+                    confidence_tap=proposal.confidence_tap,
+                )
+
+            draft_block_ids = proposal.draft_block_ids[:, :1]
+            draft_tokens = proposal.draft_block.draft_tokens
+            expected_shape = (
+                draft_block_ids.shape[0],
+                draft_block_ids.shape[1] + draft_tokens.shape[1],
+            )
+            if expected_shape != tuple(next_draft_input.topk_index.shape):
+                raise RuntimeError(
+                    "DSpark draft-prefetch block shape mismatch: "
+                    f"proposal={expected_shape}, "
+                    f"relay={tuple(next_draft_input.topk_index.shape)}."
+                )
+            next_draft_input.topk_index[:, :1].copy_(draft_block_ids)
+            next_draft_input.topk_index[:, 1:].copy_(draft_tokens)
+            if self._verify_planner.carries_confidence:
+                # Direct-prefetch consumption only reads columns 1..gamma as
+                # confidence; column 0 belongs to the legacy FutureMap payload
+                # convention and is never relayed/read on this path. Leave it
+                # untouched to avoid one device Fill between Draft and Verify.
+                if confidence is not None:
+                    if confidence.shape != next_draft_input.topk_p[:, 1:].shape:
+                        raise RuntimeError(
+                            "DSpark draft-prefetch confidence shape mismatch: "
+                            f"confidence={tuple(confidence.shape)}, "
+                            f"relay={tuple(next_draft_input.topk_p[:, 1:].shape)}."
+                        )
+                    next_draft_input.topk_p[:, 1:].copy_(confidence)
+                elif next_draft_input.topk_p.shape[1] > 1:
+                    # A confidence-enabled fallback still needs deterministic
+                    # relay contents even though the K3 path normally supplies
+                    # confidence above.
+                    next_draft_input.topk_p[:, 1:].zero_()
+            next_draft_input.draft_prefetch_positions_2d = verify_window.positions_2d
+            next_draft_input.draft_prefetch_verify_cache_loc_2d = (
+                verify_window.verify_cache_loc_2d
+            )
+            if next_draft_input.draft_prefetch_valid_cpu is None:
+                next_draft_input.draft_prefetch_valid_cpu = torch.ones(
+                    draft_block_ids.shape[0], dtype=torch.bool
+                )
+            else:
+                next_draft_input.draft_prefetch_valid_cpu.fill_(True)
+            self._draft_prefetch_stats["produced"] += 1
+            return True
+        finally:
+            batch.seq_lens = original_seq_lens
+            batch.seq_lens_cpu = original_seq_lens_cpu
+            batch.seq_lens_sum = original_seq_lens_sum
+            batch.spec_info = original_spec_info
+            batch.out_cache_loc = original_out_cache_loc
+
+    @diagnostic_stage("draft_prefetch", device=True)
+    def _schedule_draft_prefetch(
+        self,
+        *,
+        batch: ScheduleBatch,
+        next_draft_input: DFlashDraftInputV2,
+        new_seq_lens: torch.Tensor,
+        block_table_bound_cpu: Optional[torch.Tensor],
+        target_model,
+        sampling_info,
+    ) -> bool:
+        if not self.enable_draft_prefetch:
+            return False
+        next_draft_input.draft_prefetch_cancelled = False
+        self._wait_for_previous_draft_read()
+        produced = self._draft_prefetch_next(
+            batch=batch,
+            next_draft_input=next_draft_input,
+            new_seq_lens=new_seq_lens,
+            block_table_bound_cpu=block_table_bound_cpu,
+            target_model=target_model,
+            sampling_info=sampling_info,
+        )
+        next_draft_input.draft_prefetch_direct = produced
+        if produced:
+            # NPUGraphRunner publishes the sound POST_REPLAY event on the
+            # draft runner.  The next scheduler iteration must consume that
+            # event before modifying the shared req_to_token allocation map.
+            self._last_shared_read_runner = self.draft_model_runner
+        return produced
+
     def _forward_decode(
-        self, batch: ScheduleBatch, on_publish, grammar_barrier=None
+        self,
+        batch: ScheduleBatch,
+        on_publish,
+        grammar_barrier=None,
+        seq_lens_cpu_resolver=None,
     ) -> GenerationBatchResult:
         if batch.spec_info is None:
             batch.spec_info = DFlashDraftInputV2.create_idle_input(device=self.device)
@@ -614,6 +970,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             self._observers.note_idle_decode_step()
             if get_parallel().enable_dp_attention:
                 if self._draft_is_moe:
+                    self._wait_for_previous_draft_read()
                     self._proposer.run_idle_participation(batch)
                 self._verify_executor.run_idle_participation(
                     batch=batch, idle_layout=self._idle_verify_ragged_layout(batch)
@@ -626,30 +983,43 @@ class DSparkWorkerV2(BaseSpecWorker):
         bs = len(batch.seq_lens)
         device = self.device
         prefix_lens = batch.seq_lens
+        prefetch_block_table_bound_cpu = draft_input.nxt_kv_lens_cpu
 
         self._observers.begin_step()
 
         target_model = self.target_worker.model_runner.model
-        verify_window = alloc_verify_window(
-            batch=batch,
-            bs=bs,
-            device=device,
-            verify_num_draft_tokens=self.verify_num_draft_tokens,
-            block_pos_offsets=self._block_pos_offsets,
-            model_runner=self.model_runner,
-        )
-
         sampling_info = batch.sampling_info
-        with self._draft_context(), self._observers.segment(InfoSegment.DRAFT):
-            proposal = self._proposer.propose(
+        proposal = self._proposal_from_draft_prefetch(
+            draft_input=draft_input,
+            sampling_info=sampling_info,
+        )
+        proposal_from_prefetch = proposal is not None
+        verify_window = (
+            self._verify_window_from_draft_prefetch(draft_input=draft_input, bs=bs)
+            if proposal_from_prefetch
+            else None
+        )
+        if verify_window is None:
+            verify_window = alloc_verify_window(
                 batch=batch,
-                draft_input=draft_input,
-                verify_window=verify_window,
                 bs=bs,
                 device=device,
-                target_model=target_model,
-                sampling_info=sampling_info,
+                verify_num_draft_tokens=self.verify_num_draft_tokens,
+                block_pos_offsets=self._block_pos_offsets,
+                model_runner=self.model_runner,
             )
+        if proposal is None:
+            self._wait_for_previous_draft_read()
+            with self._draft_context(), self._observers.segment(InfoSegment.DRAFT):
+                proposal = self._proposer.propose(
+                    batch=batch,
+                    draft_input=draft_input,
+                    verify_window=verify_window,
+                    bs=bs,
+                    device=device,
+                    target_model=target_model,
+                    sampling_info=sampling_info,
+                )
         draft_block_ids = proposal.draft_block_ids
         draft_block = proposal.draft_block
         draft_tokens = draft_block.draft_tokens
@@ -688,9 +1058,31 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
         run_compact = self._verify_planner.should_run_compact(layout=layout)
 
-        verify_ids_2d = torch.cat(
-            [draft_block_ids[:, :1], draft_tokens], dim=1
-        ).contiguous()
+        # The upper-bound staging path below is intentionally narrow.  Compact
+        # verify and DSV4's C128 interval builder need exact per-row host
+        # lengths before ForwardBatch construction, so keep their original
+        # synchronization point.  Static K3 verify can enqueue all pointer-
+        # stable target metadata from the scheduler's allocation bound first.
+        can_stage_target_with_bound = bool(
+            seq_lens_cpu_resolver is not None
+            and proposal_from_prefetch
+            and not run_compact
+            and draft_input.nxt_kv_lens_cpu is not None
+            and not hasattr(batch.req_to_token_pool, "req_to_c128_sidecar")
+        )
+        if seq_lens_cpu_resolver is not None:
+            if can_stage_target_with_bound:
+                self._draft_prefetch_stats["target_prep_deferred"] += 1
+            else:
+                self._draft_prefetch_stats["target_prep_sync_fallback"] += 1
+                seq_lens_cpu_resolver()
+                seq_lens_cpu_resolver = None
+
+        verify_ids_2d = (
+            draft_input.topk_index
+            if proposal_from_prefetch
+            else torch.cat([draft_block_ids[:, :1], draft_tokens], dim=1).contiguous()
+        )
 
         # Must stay ahead of the target verify launch below.
         grammar_tree = (
@@ -710,7 +1102,11 @@ class DSparkWorkerV2(BaseSpecWorker):
             and self._simulate_acc_len <= 0
             and not batch.has_grammar
         )
-        prepare_mamba_track_for_verify(batch)
+        # The non-compact DFlash path rebuilds this immediately before
+        # ForwardBatch.init_new().  Compact verify bypasses DFlashVerifyInput,
+        # so only that path needs the worker-level hook.
+        if run_compact:
+            prepare_mamba_track_for_verify(batch)
         with self._observers.segment(InfoSegment.TARGET_VERIFY):
             if run_compact:
                 target_verify, hidden_strided = self._verify_executor.run_compact(
@@ -730,6 +1126,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                     verify_ids_2d=verify_ids_2d,
                     verify_window=verify_window,
                     sampling_info=sampling_info,
+                    seq_lens_cpu_resolver=seq_lens_cpu_resolver,
                 )
                 hidden_strided = None
         logits_output = target_verify.logits_output
@@ -761,6 +1158,15 @@ class DSparkWorkerV2(BaseSpecWorker):
             prefix_lens=prefix_lens,
             draft_tokens=draft_tokens,
         )
+        # With prefetch enabled, publish exact post-accept lengths immediately
+        # so the private D2H can overlap the remaining forward work.  Feature
+        # off deliberately retains the original publish point after logprobs,
+        # keeping the baseline execution order unchanged.
+        if self.enable_draft_prefetch and on_publish is not None:
+            if confidence is not None:
+                on_publish(accept.new_seq_lens, confidence=confidence)
+            else:
+                on_publish(accept.new_seq_lens)
         if batch.return_logprob:
             compute_spec_logprobs(
                 batch,
@@ -768,8 +1174,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 accept.out_tokens.reshape(-1),
                 chain_stride=self.verify_num_draft_tokens,
             )
-
-        if on_publish is not None:
+        if not self.enable_draft_prefetch and on_publish is not None:
             if confidence is not None:
                 on_publish(accept.new_seq_lens, confidence=confidence)
             else:
@@ -796,6 +1201,24 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
         logits_output.hidden_states = None
 
+        next_draft_input = None
+        if self.enable_draft_prefetch:
+            next_draft_input = make_next_draft_input(
+                bonus_tokens=accept.bonus,
+                new_seq_lens=accept.new_seq_lens,
+            )
+            self._schedule_draft_prefetch(
+                batch=batch,
+                next_draft_input=next_draft_input,
+                new_seq_lens=accept.new_seq_lens,
+                block_table_bound_cpu=prefetch_block_table_bound_cpu,
+                target_model=target_model,
+                sampling_info=sampling_info,
+            )
+        # Keep the critical enqueue path short.  The observer can do CPU
+        # bookkeeping (and optional debug D2H staging) after the prefetched
+        # Draft ACLGraph/Markov tail is already in flight, so those tasks are
+        # covered by useful NPU work instead of delaying its launch.
         self._observers.observe_verify_step(
             forward_ct=int(batch.forward_iter),
             reqs=batch.reqs,
@@ -818,11 +1241,11 @@ class DSparkWorkerV2(BaseSpecWorker):
             verify_tier_num_tokens=int(batch.spec_verify_tier_num_tokens),
             dp_tier_num_tokens=self._dp_verify_tier_num_tokens(batch),
         )
-
-        next_draft_input = make_next_draft_input(
-            bonus_tokens=accept.bonus,
-            new_seq_lens=accept.new_seq_lens,
-        )
+        if next_draft_input is None:
+            next_draft_input = make_next_draft_input(
+                bonus_tokens=accept.bonus,
+                new_seq_lens=accept.new_seq_lens,
+            )
         return GenerationBatchResult(
             logits_output=logits_output,
             next_token_ids=accept.out_tokens.reshape(-1),
@@ -838,6 +1261,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             expert_distribution_metrics=target_verify.expert_distribution_metrics,
         )
 
+    @diagnostic_stage("commit_kda", device=True)
     def _commit_target_mamba_states_after_verify(
         self,
         *,
@@ -864,7 +1288,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             mamba_track_interval = mamba_track_grid(batch.tree_cache.page_size)
             seq_lens_cpu = batch.seq_lens_cpu
             if (
-                _is_npu
+                is_npu()
                 and seq_lens_cpu is not None
                 and seq_lens_cpu.device.type == "cpu"
                 and seq_lens_cpu.ndim == 1
