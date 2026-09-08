@@ -457,6 +457,8 @@ import atexit as _kv_atexit
 import os as _kv_os
 
 _KV_LAYOUT_HITS = {}
+_KV_TOTAL = 0
+_KV_VERDICT_PRINTED = False
 _KV_STARS = "*" * 100
 
 
@@ -469,9 +471,11 @@ def kv_layout_probe(site: str, layout: str) -> None:
       ND-ONLY   this site has NO NZ branch at all - if the cache was written
                 NZ, this read is reading it in the wrong layout
     """
+    global _KV_TOTAL, _KV_VERDICT_PRINTED
     key = (site, layout)
     n = _KV_LAYOUT_HITS.get(key, 0) + 1
     _KV_LAYOUT_HITS[key] = n
+    _KV_TOTAL += 1
     if n == 1:  # only the first hit per site, so this cannot flood the log
         print(
             f"\n{_KV_STARS}\n"
@@ -479,6 +483,11 @@ def kv_layout_probe(site: str, layout: str) -> None:
             f"{_KV_STARS}",
             flush=True,
         )
+    # The server is long-lived and may be killed with SIGKILL, so do not rely on
+    # atexit alone - print the verdict once we have seen enough traffic.
+    if _KV_TOTAL >= 200 and not _KV_VERDICT_PRINTED:
+        _KV_VERDICT_PRINTED = True
+        _kv_layout_summary()
 
 
 def _kv_layout_summary() -> None:
