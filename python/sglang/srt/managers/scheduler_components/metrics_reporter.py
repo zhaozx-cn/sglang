@@ -71,6 +71,42 @@ class _CacheHitRateWindow:
         return self.hit_tokens / self.total_tokens if self.total_tokens > 0 else 0.0
 
 
+@dataclass
+class _ExpertBalancednessDecodeLogWindow:
+    first_forward_pass_id: Optional[int] = None
+    last_forward_pass_id: Optional[int] = None
+    num_forward_passes: int = 0
+    balancedness_sum: float = 0.0
+    min_balancedness: float = math.inf
+    max_balancedness: float = -math.inf
+    gpu_physical_count_sum: int = 0
+
+    def add(
+        self,
+        *,
+        forward_pass_id: int,
+        balancedness: float,
+        gpu_physical_count_sum: int,
+    ) -> None:
+        if self.first_forward_pass_id is None:
+            self.first_forward_pass_id = forward_pass_id
+        self.last_forward_pass_id = forward_pass_id
+        self.num_forward_passes += 1
+        self.balancedness_sum += balancedness
+        self.min_balancedness = min(self.min_balancedness, balancedness)
+        self.max_balancedness = max(self.max_balancedness, balancedness)
+        self.gpu_physical_count_sum += gpu_physical_count_sum
+
+    def clear(self) -> None:
+        self.first_forward_pass_id = None
+        self.last_forward_pass_id = None
+        self.num_forward_passes = 0
+        self.balancedness_sum = 0.0
+        self.min_balancedness = math.inf
+        self.max_balancedness = -math.inf
+        self.gpu_physical_count_sum = 0
+
+
 def _decode_total_seq_lens(batch: ScheduleBatch) -> int:
     """Sync-free sum of seq_lens for decode metrics."""
     if batch.seq_lens_cpu is not None:
@@ -148,6 +184,7 @@ class SchedulerMetricsReporter:
         self._eplb_balancedness_history = [
             deque(maxlen=window_size) for window_size in EPLB_BALANCEDNESS_WINDOW_SIZES
         ]
+        self._eplb_decode_log_window = _ExpertBalancednessDecodeLogWindow()
         self.cache_hit_rate_window = _CacheHitRateWindow()
         # Windowed rate for waiting-queue load estimation only; the exported
         # cache_hit_rate stats keep their per-report semantics.
@@ -1015,6 +1052,7 @@ class SchedulerMetricsReporter:
                 if m.reset_server_log_history:
                     for history in self._eplb_balancedness_history:
                         history.clear()
+                    self._eplb_decode_log_window.clear()
                 for history in self._eplb_balancedness_history:
                     history.append(balancedness)
                 balancedness_history_means = {
@@ -1025,13 +1063,37 @@ class SchedulerMetricsReporter:
                 assert m.gpu_physical_count_sum is not None
                 gpu_physical_count_sum = m.gpu_physical_count_sum.item()
 
-                logger.info(
-                    f"[Expert Balancedness] "
-                    f"forward_pass_id={m.forward_pass_id} "
-                    f"current_pass_balancedness={balancedness:.03f} "
-                    f"{''.join(f'last_{size}_average_balancedness={value:.03f} ' for size, value in balancedness_history_means.items())} "
-                    f"gpu_physical_count_sum={gpu_physical_count_sum}"
-                )
+                if (
+                    batch.forward_mode.is_decode()
+                    or batch.forward_mode.is_target_verify()
+                ):
+                    window = self._eplb_decode_log_window
+                    window.add(
+                        forward_pass_id=m.forward_pass_id,
+                        balancedness=balancedness,
+                        gpu_physical_count_sum=gpu_physical_count_sum,
+                    )
+                    if window.num_forward_passes >= self.decode_log_interval:
+                        logger.info(
+                            f"[Expert Balancedness] "
+                            f"first_forward_pass_id={window.first_forward_pass_id} "
+                            f"forward_pass_id={window.last_forward_pass_id} "
+                            f"aggregated_forward_passes={window.num_forward_passes} "
+                            f"average_balancedness={window.balancedness_sum / window.num_forward_passes:.03f} "
+                            f"min_balancedness={window.min_balancedness:.03f} "
+                            f"max_balancedness={window.max_balancedness:.03f} "
+                            f"{''.join(f'last_{size}_average_balancedness={value:.03f} ' for size, value in balancedness_history_means.items())} "
+                            f"gpu_physical_count_sum={window.gpu_physical_count_sum}"
+                        )
+                        window.clear()
+                else:
+                    logger.info(
+                        f"[Expert Balancedness] "
+                        f"forward_pass_id={m.forward_pass_id} "
+                        f"current_pass_balancedness={balancedness:.03f} "
+                        f"{''.join(f'last_{size}_average_balancedness={value:.03f} ' for size, value in balancedness_history_means.items())} "
+                        f"gpu_physical_count_sum={gpu_physical_count_sum}"
+                    )
 
             if self.enable_metrics and exports_expert_balancedness_to_prometheus():
                 assert self.metrics_collector is not None

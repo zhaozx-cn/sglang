@@ -48,6 +48,7 @@ from sglang.srt.observability.metrics_collector import (
 from sglang.srt.runtime_context import get_device as get_device_namespace
 from sglang.srt.runtime_context import (
     get_exec,
+    get_parallel,
     get_schedule,
     logs_expert_balancedness_to_server_log,
     reports_expert_balancedness,
@@ -348,6 +349,12 @@ class _SinglePassGatherer(ABC):
                     rank,
                     elastic_ep_enabled=get_exec().moe.elastic_ep_backend is not None,
                 )
+            elif get_exec().moe.deepep_mode == "auto":
+                # AUTO switches between normal and low-latency dispatch per
+                # forward.  Count the post-routing TopK ids in both cases so
+                # graph replay does not depend on a Python-side hook after the
+                # NPU DeepEP low-latency dispatch.
+                return _SelectExpertsSinglePassGatherer(expert_location_metadata, rank)
             else:
                 raise NotImplementedError
 
@@ -751,11 +758,25 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
             num_gpu=self._expert_location_metadata.ep_size,
         )
         gpu_physical_count = gpu_physical_count.to(get_device_namespace().device)
-        torch.distributed.reduce(
-            gpu_physical_count, dst=0, op=torch.distributed.ReduceOp.SUM
-        )
 
-        if self._rank == 0:
+        parallel = get_parallel()
+        if parallel.attn_dp_size > 1:
+            # DP-attention schedulers make progress independently, so their
+            # forward-pass ids and prefill/decode sequences are not required to
+            # match.  A WORLD collective here can therefore wait forever (or
+            # combine unrelated passes).  MoE routing already operates on a
+            # DP-local token shard; report that shard from its attention-TP
+            # leader without adding communication to the model forward.
+            should_emit = parallel.attn_tp_rank == 0
+        else:
+            # Preserve the established recorder behaviour for the lock-step,
+            # non-DP case used by other models.
+            torch.distributed.reduce(
+                gpu_physical_count, dst=0, op=torch.distributed.ReduceOp.SUM
+            )
+            should_emit = self._rank == 0
+
+        if should_emit:
             self._handle_metric_eplb_heatmap(gpu_physical_count)
 
             utilization_rate_gpu = torch.mean(
