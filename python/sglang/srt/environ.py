@@ -923,6 +923,9 @@ class Envs:
     # ===================================================================
     SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)
     SGLANG_NPU_USE_MULTI_STREAM = EnvBool(False)
+    # Kimi-K3 attention-TP shared experts: overlap AG / MLP / RS with the
+    # routed front / DeepEP dispatch / routed GEMMs, respectively.
+    SGLANG_NPU_FINE_GRAINED_MOE_DUAL_STREAM = EnvBool(False)
     SGLANG_NPU_USE_MLAPO = EnvBool(False)
     SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD = EnvBool(False)
     # Forward native implementation for activation gelu tanh for model Skywork-Reward-Gemma-2-27B-v0.2
