@@ -1551,7 +1551,10 @@ class Envs:
     # Keep K3's post-MoE residual stream token-sharded between consecutive
     # SP-MoE layers. The next attention-residual aggregation and snapshot
     # bank write run on the local shard, then only the normalized attention
-    # input is all-gathered. Requires SGLANG_K3_SP_COLLECTIVE.
+    # input is all-gathered. DSpark batches its sharded captures into one
+    # separate all-gather at the end of the model forward.
+    # Works with ordinary collectives; SGLANG_K3_SP_COLLECTIVE optionally
+    # enables fused communication kernels on supported devices. Requires PP=1.
     SGLANG_K3_SP_ATTN_RES = EnvBool(False)
     # Fused o_proj GEMM + all-reduce (bf16, TP 2..8, SM100+): one
     # kernel computes the TP-local o_proj partial and the cross-rank sum over

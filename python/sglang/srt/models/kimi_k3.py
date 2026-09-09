@@ -2884,21 +2884,40 @@ class KimiK3LinearModel(nn.Module):
             residual = None
 
         # Carry the raw residual stream as a token shard across consecutive
-        # SP-MoE layers. PP transfer and dspark capture require full tensors,
-        # so those uncommon paths keep the established gather-per-layer flow.
+        # SP-MoE layers. DSpark gathers its auxiliary features separately;
+        # only PP transfer requires the gather-per-layer flow. This also works
+        # with ordinary collectives (including HCCL), without the fused kernels.
         sp_attn_res = (
             attn_res is not None
             and envs.SGLANG_K3_SP_ATTN_RES.get()
             and self.pp_group.world_size == 1
-            and self.dspark_layers_to_capture is None
-            and k3_sp_collective.enabled()
         )
         sp_sharded = False
+        sp_start_nvb = 0
         aux_hidden_states = []
+        aux_sharded_indices = []
         for i in range(self.start_layer, self.end_layer):
             if sp_sharded and not self.layers[i]._sp_moe:
+                # Only snapshots written during shard carry need restoring;
+                # earlier blocks are already valid for every token on each rank.
+                bank = attn_res.block_residual
+                nvb = attn_res.num_valid_blocks
+                if nvb > sp_start_nvb:
+                    local_bank = bank[
+                        _sp_local_rows(hidden_states), sp_start_nvb:nvb, :
+                    ]
+                    full_bank = _sp_all_gather_rows(local_bank.flatten(1))
+                    # Consume full_bank before gathering the stream: for one
+                    # block both gathers may reuse the same symmetric buffer.
+                    bank[:, sp_start_nvb:nvb, :].copy_(
+                        full_bank.view(
+                            bank.shape[0], nvb - sp_start_nvb, bank.shape[2]
+                        )
+                    )
+                    del full_bank, local_bank
                 hidden_states = _sp_all_gather_rows(hidden_states)
                 sp_sharded = False
+            input_sharded = sp_sharded
             with get_global_expert_distribution_recorder().with_current_layer(i):
                 hidden_states, residual, sp_sharded = self.layers[i](
                     positions=positions,
@@ -2907,15 +2926,23 @@ class KimiK3LinearModel(nn.Module):
                     residual=residual,
                     attn_res=attn_res,
                     zero_allocator=zero_allocator,
-                    input_sharded=sp_sharded,
+                    input_sharded=input_sharded,
                     keep_sharded=sp_attn_res,
                 )
+            if sp_sharded and not input_sharded:
+                # This layer's attention-side bank write still used full rows.
+                # Only subsequent sharded layers can leave partial snapshots.
+                sp_start_nvb = attn_res.num_valid_blocks
             if (
                 self.dspark_layers_to_capture is not None
                 and i in self.dspark_layers_to_capture
             ):
+                if sp_sharded:
+                    aux_sharded_indices.append(len(aux_hidden_states))
                 aux_hidden_states.append(
-                    self._dspark_capture_stream(i, hidden_states, residual, attn_res)
+                    self._dspark_capture_stream(
+                        i, hidden_states, residual, attn_res, sp_sharded=sp_sharded
+                    )
                 )
 
         if not self.pp_group.is_last_rank:
@@ -2970,6 +2997,24 @@ class KimiK3LinearModel(nn.Module):
                     hidden_states, _ = self.norm(hidden_states, residual)
 
         if self.dspark_layers_to_capture is not None:
+            if aux_sharded_indices:
+                # Batch only sharded captures; dense-layer captures are already
+                # full-sized. Keep their original order in aux_hidden_states.
+                local_aux = torch.cat(
+                    [aux_hidden_states[j] for j in aux_sharded_indices], dim=-1
+                )
+                full_aux = local_aux.new_empty(
+                    (hidden_states.shape[0], local_aux.shape[1])
+                )
+                # Own the output storage, including the single-capture case:
+                # a tuned AG could overwrite the main output's symmetric buffer.
+                # Split returns views that retain this private allocation.
+                get_parallel().attn_tp_group.all_gather_into_tensor(full_aux, local_aux)
+                for j, captured in zip(
+                    aux_sharded_indices,
+                    full_aux.split(self.config.hidden_size, dim=-1),
+                ):
+                    aux_hidden_states[j] = captured
             return hidden_states, aux_hidden_states
         return hidden_states
 
@@ -2979,14 +3024,23 @@ class KimiK3LinearModel(nn.Module):
         hidden_states: torch.Tensor,
         residual: Optional[torch.Tensor],
         attn_res: Optional[AttnResidual],
+        *,
+        sp_sharded: bool = False,
     ) -> torch.Tensor:
         """Stream value after `layer_idx`: the pre-norm mixture its next
         consumer would compute (next layer's attention side; output side
-        for the last layer)."""
+        for the last layer). Sharded captures stay local until the model's
+        final batched auxiliary gather."""
         if attn_res is None:
+            assert not sp_sharded
             return hidden_states if residual is None else hidden_states + residual
+        rows = _sp_local_rows(hidden_states) if sp_sharded else None
         if residual is not None:
             # Materialize a delayed MLP add (mirrors the PP-wire fold).
+            # Shard carry currently returns residual=None; keep this alignment
+            # for callers that may retain a pending residual in the future.
+            if sp_sharded and residual.shape[0] != hidden_states.shape[0]:
+                residual = residual[rows]
             hidden_states = residual + hidden_states
         if layer_idx + 1 < self.end_layer:
             next_layer = self.layers[layer_idx + 1]
@@ -2998,9 +3052,10 @@ class KimiK3LinearModel(nn.Module):
             score_proj = self.output_attn_res_proj
             score_norm = self.output_attn_res_norm
             nvb = _cdiv(self.end_layer, self.config.attn_res_block_size)
-        return aggregate_stream(
-            hidden_states, attn_res.block_residual, nvb, score_proj, score_norm
-        )
+        bank = attn_res.block_residual
+        if sp_sharded:
+            bank = bank[rows]
+        return aggregate_stream(hidden_states, bank, nvb, score_proj, score_norm)
 
 
 class KimiK3LinearForCausalLM(nn.Module):
