@@ -3,6 +3,23 @@
 import torch
 
 
+def concat_mla_cache_for_paged_attention(
+    latent: torch.Tensor, rope: torch.Tensor, *, is_nz: bool
+) -> torch.Tensor:
+    """Build token-major [blocks, page, 1, latent_dim + rope_dim] PA input.
+
+    NZ buffers expose that public shape but store feature tiles before tokens.
+    Concatenate their logical tile views so only the final combined cache is
+    materialized, instead of allocating two full unpacked cache copies first.
+    """
+    if not is_nz:
+        return torch.cat([latent, rope], dim=-1)
+    blocks, page_size = latent.shape[:2]
+    latent_tiles = latent.view(blocks, -1, page_size, 16).transpose(1, 2)
+    rope_tiles = rope.view(blocks, -1, page_size, 16).transpose(1, 2)
+    return torch.cat([latent_tiles, rope_tiles], dim=2).view(blocks, page_size, 1, -1)
+
+
 def gather_mla_cache_pages(
     cache: torch.Tensor, block_ids: torch.Tensor, *, is_nz: bool
 ) -> torch.Tensor:
