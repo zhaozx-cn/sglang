@@ -2758,8 +2758,7 @@ class AscendAttnBackend(AttentionBackend):
             kv_c = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
             k_pe = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
 
-            if self.use_fia and (layer.tp_q_head_num // layer.tp_k_head_num) >= 8:
-                """layer.tp_q_head_num // layer.tp_k_head_num < 8 will support in the later version of CANN"""
+            if self.use_fia:
                 if is_fia_nz():
                     kv_c = _reshape_kv_for_fia_nz(
                         kv_c, layer.tp_k_head_num, self.kv_lora_rank, self.page_size
