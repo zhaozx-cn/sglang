@@ -157,7 +157,6 @@ class TestForwardMetadata(unittest.TestCase):
             "actual_seq_lengths_kv",
             "swa_mask",
             "prefix_lens",
-            "flatten_prefix_block_tables",
         }
         self.assertEqual(names, expected)
 

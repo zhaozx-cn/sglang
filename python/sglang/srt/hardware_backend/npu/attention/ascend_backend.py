@@ -16,7 +16,10 @@ from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.ascend_torch_native_backend import (
     AscendTorchNativeAttnBackend,
 )
-from sglang.srt.hardware_backend.npu.attention.mla_cache import gather_mla_cache_pages
+from sglang.srt.hardware_backend.npu.attention.mla_cache import (
+    assemble_mla_kv_from_prefix,
+    gather_mla_cache_prefix,
+)
 from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     is_fia_nz,
     is_mla_preprocess_enabled,
@@ -103,7 +106,6 @@ class ForwardMetadata:
 
     # prefix cache
     prefix_lens: Optional[torch.Tensor] = None
-    flatten_prefix_block_tables: Optional[torch.Tensor] = None
 
 
 class AscendAttnMaskBuilder:
@@ -344,6 +346,7 @@ class AscendAttnBackend(AttentionBackend):
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.graph_mode = False
+        self._cached_prefix_branch_logged = False
         self.use_fa = get_bool_env_var("ASCEND_USE_FA", "False")
         self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
         self.use_fias_v2_bsnd = (
@@ -560,23 +563,6 @@ class AscendAttnBackend(AttentionBackend):
             self.forward_metadata.prefix_lens = forward_batch.extend_prefix_lens.to(
                 "cpu"
             )
-            seq_prefix_lens = self.forward_metadata.prefix_lens.tolist()
-            self.forward_metadata.flatten_prefix_block_tables = torch.empty(
-                0, dtype=torch.int32
-            ).to(self.device)
-            for req_idx, seq_len in zip(
-                forward_batch.req_pool_indices.tolist(), seq_prefix_lens
-            ):
-                req_indices = self.req_to_token_pool.req_to_token[req_idx]
-                req_prefix_block_tables = (
-                    req_indices[:seq_len][:: self.page_size] // self.page_size
-                )
-                self.forward_metadata.flatten_prefix_block_tables = torch.cat(
-                    (
-                        self.forward_metadata.flatten_prefix_block_tables,
-                        torch.flatten(req_prefix_block_tables),
-                    )
-                )
 
         if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
             self.forward_metadata.swa_out_cache_loc = (
@@ -1637,77 +1623,106 @@ class AscendAttnBackend(AttentionBackend):
                         -1, layer.tp_q_head_num * layer.v_head_dim
                     )
         elif sum(forward_batch.extend_prefix_lens_cpu) > 0:
-            # This branch adds support for prefix cache for GLM-4.7-Flash.
-            # When using the MLA architecture, if qk head dim equals v head dim and the head count is not a power of 2,
-            # we use the FIA kernel for computation.
+            # Cached-prefix MLA extend uses FIA when qk head dim equals v head
+            # dim and the head count is not a power of two.
+            if not self._cached_prefix_branch_logged:
+                if get_parallel().attn_tp_rank == 0:
+                    prefix_lens = forward_batch.extend_prefix_lens_cpu
+                    logger.info(
+                        "Entered Ascend MLA cached-prefix extend branch: "
+                        "batch_size=%d, cached_seqs=%d, cached_tokens=%d, "
+                        "new_tokens=%d",
+                        len(prefix_lens),
+                        sum(prefix_len > 0 for prefix_len in prefix_lens),
+                        sum(prefix_lens),
+                        sum(self.forward_metadata.extend_seq_lens_cpu_int),
+                    )
+                self._cached_prefix_branch_logged = True
+
             q = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
-
-            k_buffer = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
-            v_buffer = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
-            kv_cached = gather_mla_cache_pages(
-                k_buffer,
-                self.forward_metadata.flatten_prefix_block_tables,
-                is_nz=is_fia_nz(),
-            )
-            k_rope_cached = gather_mla_cache_pages(
-                v_buffer,
-                self.forward_metadata.flatten_prefix_block_tables,
-                is_nz=is_fia_nz(),
-            ).flatten(0, 1)
-
-            assert layer.kv_b_proj is not None
-            kv = layer.kv_b_proj(kv_cached)[0].view(
-                -1, layer.tp_k_head_num, self.qk_nope_head_dim + layer.v_head_dim
-            )
-            k_nope, v_pre = kv.split(
-                [self.qk_nope_head_dim, layer.v_head_dim], dim=-1
-            )
-
-            k_rope = k_rope_cached.expand(-1, layer.tp_k_head_num, -1)
-            k_pre = torch.cat([k_nope, k_rope], dim=-1)
 
             attn_output = torch.empty(
                 (q.size(0), layer.tp_q_head_num, layer.v_head_dim),
                 device=q.device,
                 dtype=q.dtype,
             )
+            k_buffer = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+            v_buffer = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
+            assert layer.kv_b_proj is not None
+            use_fia_nz = is_fia_nz()
+
             q_len_offset = 0
-            prefix_len_offset = 0
-            for q_len, prefix_len in zip(
-                self.forward_metadata.extend_seq_lens_cpu_int,
-                self.forward_metadata.prefix_lens,
+            for seq_idx, (q_len, prefix_len) in enumerate(
+                zip(
+                    self.forward_metadata.extend_seq_lens_cpu_int,
+                    self.forward_metadata.prefix_lens,
+                )
             ):
+                q_len = int(q_len)
+                prefix_len = int(prefix_len)
+                if q_len == 0:
+                    continue
+
                 k_cur_slice = k[None, q_len_offset : q_len_offset + q_len]
                 v_cur_slice = v[None, q_len_offset : q_len_offset + q_len]
-                k_pre_slice = k_pre[
-                    None, prefix_len_offset : prefix_len_offset + prefix_len
-                ]
-                v_pre_slice = v_pre[
-                    None, prefix_len_offset : prefix_len_offset + prefix_len
-                ]
 
-                k_full = torch.cat([k_pre_slice, k_cur_slice], dim=1)
-                v_full = torch.cat([v_pre_slice, v_cur_slice], dim=1)
+                if prefix_len > 0:
+                    block_table = self.forward_metadata.block_tables[seq_idx]
+                    kv_cached = gather_mla_cache_prefix(
+                        k_buffer,
+                        block_table,
+                        prefix_len,
+                        is_nz=use_fia_nz,
+                    )
+                    k_rope_cached = gather_mla_cache_prefix(
+                        v_buffer,
+                        block_table,
+                        prefix_len,
+                        is_nz=use_fia_nz,
+                    )
+                    kv = layer.kv_b_proj(kv_cached)[0].view(
+                        -1,
+                        layer.tp_k_head_num,
+                        self.qk_nope_head_dim + layer.v_head_dim,
+                    )
+                    k_nope, v_pre = kv.split(
+                        [self.qk_nope_head_dim, layer.v_head_dim], dim=-1
+                    )
+                    k_full, v_full = assemble_mla_kv_from_prefix(
+                        k_nope,
+                        k_rope_cached,
+                        v_pre,
+                        k_cur_slice,
+                        v_cur_slice,
+                    )
+                else:
+                    k_full = k_cur_slice
+                    v_full = v_cur_slice
 
-                attn_output[q_len_offset : q_len_offset + q_len] = (
-                    torch.ops.npu.npu_fused_infer_attention_score(
-                        q[None, q_len_offset : q_len_offset + q_len],
-                        k_full,
-                        v_full,
-                        num_heads=layer.tp_q_head_num,
-                        num_key_value_heads=layer.tp_k_head_num,
-                        input_layout="BSND",  # todo, TND not supports q_heads!=k_heads
-                        atten_mask=self.fia_mask,
-                        sparse_mode=3,
-                        scale=layer.scaling,
-                        next_tokens=0,
-                    )[0]
-                )
+                if prefix_len > 0:
+                    # The final K/V tensors no longer alias these projection
+                    # inputs. Release them before FIA requests its workspace.
+                    del kv_cached, k_rope_cached, kv, k_nope, v_pre
+
+                result = torch.ops.npu.npu_fused_infer_attention_score(
+                    q[None, q_len_offset : q_len_offset + q_len],
+                    k_full,
+                    v_full,
+                    num_heads=layer.tp_q_head_num,
+                    num_key_value_heads=layer.tp_k_head_num,
+                    input_layout="BSND",  # todo, TND not supports q_heads!=k_heads
+                    atten_mask=self.fia_mask,
+                    sparse_mode=3,
+                    scale=layer.scaling,
+                    next_tokens=0,
+                )[0]
+                attn_output[q_len_offset : q_len_offset + q_len] = result
+
+                # Do not retain one request's expanded prefix while gathering
+                # the next. All operations are ordered on the current stream.
+                del result, k_full, v_full
                 q_len_offset += q_len
-                prefix_len_offset += prefix_len
-            attn_output = attn_output.view(
-                -1, layer.tp_q_head_num * layer.v_head_dim
-            )
+            attn_output = attn_output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
         else:
             if layer.qk_head_dim == layer.v_head_dim:
                 """FIA will support multi-bs in the later version of CANN"""
