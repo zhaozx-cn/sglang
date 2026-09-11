@@ -23,6 +23,10 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.draft_worker_common import make_draft_input_v2
 from sglang.srt.speculative.dspark_components.dspark_planner import VerifyWindow
+from sglang.srt.speculative.dspark_components.dspark_prefetch import (
+    DSparkDraftInputV2,
+    deterministic_draft_logits,
+)
 from sglang.srt.speculative.spec_info import (
     SpeculativeAlgorithm,
     spec_scale_global_num_tokens,
@@ -84,6 +88,8 @@ class DraftProposal(msgspec.Struct, frozen=True):
     draft_hidden: Optional[torch.Tensor]
     confidence: Optional[torch.Tensor] = None
     confidence_tap: Optional[torch.Tensor] = None
+    confidence_raw: Optional[torch.Tensor] = None
+    confidence_valid: Optional[torch.Tensor] = None
     folded: bool = False
 
 
@@ -112,8 +118,19 @@ def make_next_draft_input(
     *,
     bonus_tokens: torch.Tensor,
     new_seq_lens: torch.Tensor,
-) -> DFlashDraftInputV2:
-    return make_draft_input_v2(bonus_tokens=bonus_tokens, new_seq_lens=new_seq_lens)
+    prefetch_gamma: Optional[int] = None,
+    seq_lens_cpu: Optional[torch.Tensor] = None,
+) -> DSparkDraftInputV2:
+    state = make_draft_input_v2(
+        bonus_tokens=bonus_tokens,
+        new_seq_lens=new_seq_lens,
+        input_cls=DSparkDraftInputV2,
+    )
+    if prefetch_gamma is not None:
+        state.init_mock_proposal(prefetch_gamma)
+        if seq_lens_cpu is not None:
+            state.prefetched_seq_lens_cpu = seq_lens_cpu.clone()
+    return state
 
 
 def resolve_greedy_mask(
@@ -234,6 +251,61 @@ class DraftBlockProposer:
             return draft_tp_context(get_parallel().attn_tp_group)
         return nullcontext()
 
+    def _embed_module(self, target_model):
+        return unwrap_lora_layer(
+            self.draft_model.embed_tokens
+            if not self.sample_from_anchor
+            else target_model.get_input_embeddings()
+        )
+
+    def take_prefetched_proposal(
+        self,
+        *,
+        draft_input: DSparkDraftInputV2,
+        sampling_info,
+        vocab_size: int,
+        require_logits: bool = False,
+        compact: bool = True,
+    ) -> DraftProposal:
+        tokens, logits, confidence, confidence_raw, confidence_valid = (
+            draft_input.take_prefetched()
+        )
+        if tokens is None:
+            raise RuntimeError(
+                "DSPARK prefetch expected a complete or bootstrap proposal"
+            )
+        bs = tokens.shape[0]
+        assert tokens.shape == (bs, self.gamma)
+        all_greedy = sampling_info is None or sampling_info.is_all_greedy
+        if (not all_greedy or require_logits) and logits is None:
+            logits = deterministic_draft_logits(tokens, vocab_size)
+        # Request sampling parameters are immutable. Rebuild these small views
+        # after filter/merge; the carried logits are the untempered Markov q.
+        temperatures = (
+            torch.ones(bs, dtype=torch.float32, device=tokens.device)
+            if sampling_info is None
+            else sampling_info.temperatures.view(-1).to(torch.float32).clamp_min(1e-5)
+        )
+        anchors = draft_input.bonus_tokens.view(-1, 1)
+        if compact:
+            # Compact verify kernels address anchors with a gamma row stride.
+            anchors = anchors.expand(-1, self.gamma).contiguous()
+        return DraftProposal(
+            draft_block_ids=anchors,
+            draft_block=DraftBlockResult(
+                draft_tokens=tokens,
+                corrected_logits=logits,
+                greedy_mask=resolve_greedy_mask(
+                    bs=bs, sampling_info=sampling_info, device=tokens.device
+                ),
+                temperatures=temperatures,
+            ),
+            draft_hidden=None,
+            confidence=confidence,
+            confidence_raw=confidence_raw,
+            confidence_valid=confidence_valid,
+        )
+
     def propose(
         self,
         *,
@@ -245,11 +317,7 @@ class DraftBlockProposer:
         target_model,
         sampling_info,
     ) -> DraftProposal:
-        embed_module = unwrap_lora_layer(
-            self.draft_model.embed_tokens
-            if not self.sample_from_anchor
-            else target_model.get_input_embeddings()
-        )
+        embed_module = self._embed_module(target_model)
         draft_sampler = self._draft_sampler
         all_greedy = sampling_info is None or sampling_info.is_all_greedy
         fwd = self._run_forward(
@@ -405,6 +473,13 @@ class DraftBlockProposer:
         if batch.seq_lens_cpu is not None:
             draft_seq_lens_cpu = batch.seq_lens_cpu + query_token_num
             draft_seq_lens_sum = int(draft_seq_lens_cpu.sum())
+        elif not getattr(
+            self.draft_model_runner.attn_backend, "needs_cpu_seq_lens", True
+        ):
+            # Device-only backends use the real GPU prefix. Do not substitute
+            # allocation headroom for accepted sequence lengths during prefetch.
+            draft_seq_lens_cpu = None
+            draft_seq_lens_sum = None
         elif draft_input.nxt_kv_lens_cpu is not None:
             draft_seq_lens_cpu = draft_input.nxt_kv_lens_cpu
             draft_seq_lens_sum = int(draft_input.nxt_kv_lens_sum)

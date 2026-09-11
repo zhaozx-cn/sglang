@@ -283,11 +283,10 @@ class FutureMap:
             self.new_seq_lens_buf = torch.empty(
                 (self.req_pool_size,), dtype=torch.int64, device=self.device
             )
-        # Pinned host copy of new_seq_lens_buf + private stream for fwd-prepare
-        # D2H pulls (gated only on publish, off the schedule stream). CUDA-only:
-        # recovers occupancy lost to the WAR barrier (also CUDA-only); other
-        # platforms have no barrier and use the plain .cpu() bootstrap path.
-        if _is_cuda:
+        # Keep CPU length preparation behind acceptance publication, rather than
+        # the scheduler's WAR fence. NPU draft prefetch also enables that fence;
+        # a .cpu() on schedule_stream would otherwise wait for the entire draft.
+        if _is_cuda or (_is_npu and get_spec().speculative_dspark_draft_prefetch):
             self.new_seq_lens_cpu_pinned = torch.empty(
                 (self.req_pool_size,), dtype=torch.int64, pin_memory=True
             )
@@ -490,6 +489,19 @@ class FutureMap:
                 # Poison consumed rows: each row must be re-published/seeded
                 # before the next resolve gathers it (safe here: the forward's
                 # re-publish is fenced behind this stream via wait_stream).
+                _assert_nonneg_and_invalidate(batch.seq_lens, self.new_seq_lens_buf, fi)
+            return
+
+        # DSPARK already resolved these exact accepted lengths before launching
+        # its carried draft. The owned mirror follows request filter/merge, so
+        # reading it needs neither a second D2H nor a wait for the later draft.
+        prefetched_seq_lens_cpu = getattr(draft_input, "prefetched_seq_lens_cpu", None)
+        if prefetched_seq_lens_cpu is not None:
+            assert prefetched_seq_lens_cpu.device.type == "cpu"
+            assert prefetched_seq_lens_cpu.shape == batch.seq_lens.shape
+            batch.seq_lens_cpu = prefetched_seq_lens_cpu
+            batch.seq_lens_sum = int(prefetched_seq_lens_cpu.sum())
+            if _DEBUG_ASSERT:
                 _assert_nonneg_and_invalidate(batch.seq_lens, self.new_seq_lens_buf, fi)
             return
 
