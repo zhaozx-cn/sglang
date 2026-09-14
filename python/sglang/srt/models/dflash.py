@@ -254,9 +254,7 @@ class DFlashAttention(nn.Module):
             attn_type=self.attn_type,
         )
 
-    def forward_prepare_npu(self, positions, hidden_states):
-        qkv, _ = self.qkv_proj(hidden_states)
-
+    def forward_prepare_npu(self, positions, qkv):
         if self.attn.layer_id == 0:
             self.rotary_emb.get_cos_sin_with_position(positions)
         q, k, v = split_qkv_rmsnorm_rope(
@@ -282,7 +280,7 @@ class DFlashAttention(nn.Module):
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         if _is_npu:
-            q, k, v = self.forward_prepare_npu(positions, hidden_states)
+            q, k, v = self.forward_prepare_npu(positions, qkv)
         elif self.use_table_qk_norm_rope and qkv.dtype == torch.bfloat16:
             from sglang.srt.speculative.dflash_utils import table_qk_norm_rope_
 
@@ -348,6 +346,14 @@ class DFlashAttention(nn.Module):
         return k_by_head.view_as(k)
 
     def apply_k_rope(self, positions: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
+        if _is_npu:
+            # Ascend's fused Q/K RoPE consumes [tokens, heads, head_dim].
+            # KV-only projection returns a flattened view on this path.
+            original_shape = k.shape
+            k = k.reshape(k.shape[0], -1, self.head_dim)
+            dummy_q = torch.empty_like(k)
+            _, k = self.rotary_emb(positions, dummy_q, k)
+            return k.reshape(original_shape)
         # Match K shape so RoPE kernel head-count check passes on all backends.
         dummy_q = k.new_empty(k.shape)
         _, k = self.rotary_emb(positions, dummy_q, k)

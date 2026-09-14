@@ -7,15 +7,14 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
-    MarkovGreedyStep,
-)
+from sglang.kernels.ops.speculative.dspark.dspark_draft_model import MarkovGreedyStep
 from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
 from sglang.srt.environ import envs
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.dflash import DFlashDraftModel
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.dflash_utils import can_dflash_slice_qkv_weight
 from sglang.srt.speculative.dspark_components.dspark_config import (
     get_dspark_sample_from_anchor,
@@ -25,8 +24,10 @@ from sglang.srt.speculative.ragged_verify import (
     RaggedVerifyMode,
     read_ragged_verify_mode,
 )
+from sglang.srt.utils import is_npu
 
 logger = logging.getLogger(__name__)
+_is_npu = is_npu()
 
 StepSampler = Callable[[torch.Tensor, int], torch.Tensor]
 
@@ -504,6 +505,7 @@ class DSparkDraftMixin:
             self.markov_head = build_markov_head(config)
         self.confidence_head = build_confidence_head(config)
         self.lm_head: Optional[nn.Module] = None
+        self._npu_greedy_shard = None
         # Expose the draft's own layer count so the draft ModelRunner sizes the
         # draft KV pool correctly. Some DSpark draft checkpoints inherit the
         # target's ``num_nextn_predict_layers`` (>0) on the config; without this
@@ -520,6 +522,59 @@ class DSparkDraftMixin:
         if not self.is_nemotron_35_draft:
             self.embed_tokens = embed_tokens
         self.lm_head = lm_head
+        self._npu_greedy_shard = None
+        if (
+            _is_npu
+            and type(self.markov_head) is VanillaMarkov
+            and envs.SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD.get()
+            and envs.SGLANG_DSPARK_FUSED_LOCAL_TOP1.get()
+            and not should_apply_lm_head_quant_method(lm_head, lm_head.quant_method)
+        ):
+            from sglang.srt.speculative.dspark_components.dspark_greedy_shard import (
+                VanillaMarkovGreedyShard,
+            )
+
+            parallel = get_parallel()
+            group = (
+                parallel.attn_tp_group
+                if getattr(lm_head, "use_attn_tp_group", False)
+                else parallel.tp_group
+            )
+            # A DP-local LM head has the same vocabulary partition on each
+            # attention-TP group. Its top-1 exchange never crosses DP groups.
+            # A global TP head under DP still requires the existing fallback.
+            if parallel.attn_cp_size == 1 and (
+                parallel.attn_dp_size == 1
+                or getattr(lm_head, "use_attn_tp_group", False)
+            ):
+                self._npu_greedy_shard = VanillaMarkovGreedyShard.create(
+                    self.markov_head, lm_head, group
+                )
+            if self._npu_greedy_shard is not None:
+                logger.info(
+                    "DSpark VanillaMarkov NPU greedy graph: W2 compute sharded "
+                    "over TP%d, BF16 local top1 enabled; sampling retains full logits.",
+                    group.world_size,
+                )
+            else:
+                logger.info(
+                    "DSpark VanillaMarkov greedy shard: unsupported layout/dtype."
+                )
+
+    def compute_greedy_proposal(self, hidden, *, first_prev_tokens, sync):
+        """Optional greedy graph tail; never changes the full-logits API."""
+        shard = self._npu_greedy_shard
+        if shard is None or hidden.dtype != torch.bfloat16:
+            return None
+        if self.logits_mup_width_multiplier:
+            hidden = hidden / self.logits_mup_width_multiplier
+        local = project_through_lm_head(hidden, self.lm_head)
+        bs = first_prev_tokens.numel()
+        return shard.sample(
+            local.view(bs, -1, local.shape[-1]),
+            first_prev_tokens=first_prev_tokens,
+            sync=sync,
+        )
 
     def forward_embed(self, input_ids: torch.Tensor) -> torch.Tensor:
         # Embeds with the shared target embedding INSIDE the draft graph
@@ -835,8 +890,14 @@ class DSparkDraftMixin:
         k32 = k32 * stacked["k_norm_weight"].view(1, num_layers, 1, head_dim)
         k_all = k32.to(ctx_hidden.dtype)
         k_flat = k_all.reshape(tokens, num_layers * kv_size)
-        dummy_q = k_flat.new_empty(k_flat.shape)
-        _, k_flat = attn0.rotary_emb(positions, dummy_q, k_flat)
+        if _is_npu:
+            k_for_rope = k_flat.view(tokens, num_layers * num_kv_heads, head_dim)
+            dummy_q = torch.empty_like(k_for_rope)
+            _, k_for_rope = attn0.rotary_emb(positions, dummy_q, k_for_rope)
+            k_flat = k_for_rope.reshape(tokens, num_layers * kv_size)
+        else:
+            dummy_q = k_flat.new_empty(k_flat.shape)
+            _, k_flat = attn0.rotary_emb(positions, dummy_q, k_flat)
         k_all = (
             k_flat.view(tokens, num_layers, num_kv_heads, head_dim)
             .permute(1, 0, 2, 3)

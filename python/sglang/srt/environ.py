@@ -510,6 +510,7 @@ class Envs:
     SGLANG_DSPARK_BLOCK_ACCEPT_ONLINE_INTERVAL = EnvInt(0)
     SGLANG_DSPARK_ENABLE_SPS_RECORD = EnvBool(False)
     SGLANG_DSPARK_FAST_KERNEL = EnvBool(True)
+    SGLANG_DSPARK_FUSED_LOCAL_TOP1 = EnvBool(False)
     SGLANG_DSPARK_FP32_LM_HEAD = EnvBool(False)
     SGLANG_DSPARK_FAST_SAMPLING = EnvBool(True)
     SGLANG_DSPARK_FOLDED_SAMPLING = EnvInt(DsparkFoldedSampling.AUTO)
@@ -615,6 +616,10 @@ class Envs:
     # since process_batch_result_prefill discards next_token_ids for those anyway.
     SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM = EnvBool(False)
     SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH = EnvBool(False)
+    # Fuse the speculative DP-attention prefill-priority probe and steady
+    # decode metadata synchronization into one collective. Opt-in while the
+    # path is validated across accelerator backends.
+    SGLANG_SPECULATIVE_FUSED_DP_MLP_SYNC = EnvBool(False)
 
     # ===================================================================
     # Radix and sparse KV caches
@@ -897,6 +902,20 @@ class Envs:
     SGLANG_USE_AG_AFTER_QLORA = EnvBool(False)
     # Enable int4x2 weights loading
     SGLANG_NPU_W4A4_NEW_PACKING = EnvBool(False)
+    # Kimi-K3/DSpark hot-path experiments. These stay opt-in so each component
+    # can be disabled independently during graph parity and performance A/Bs.
+    SGLANG_NPU_FUSED_KDA_RAGGED_IO = EnvBool(False)
+    SGLANG_NPU_FUSED_KDA_ONORM = EnvBool(False)
+    SGLANG_NPU_REUSE_KDA_VERIFY_METADATA = EnvBool(False)
+    # Activate verify tokens together inside the recurrent kernel. Experimental;
+    # default to standalone FP32 gates until same-stack NPU measurements pass.
+    SGLANG_NPU_KDA_VERIFY_PARALLEL_GATES = EnvBool(False)
+    # 0 preserves the kernel default. Explicit 32/64/128 tiles are for A/Bs.
+    SGLANG_NPU_KDA_VERIFY_VALUE_BLOCK_SIZE = EnvInt(0)
+    # Feed fixed-width KDA verify to causal_conv1d as [B, T, C]. This avoids
+    # rebuilding/casting a dense query_start_loc inside every KDA layer; the
+    # cache-index int64 view is built once per forward/graph body instead.
+    SGLANG_NPU_KDA_DENSE_CONV3D = EnvBool(False)
     # Use the graph-safe Triton-Ascend kernel for masked speculative KV commits.
     SGLANG_NPU_USE_TRITON_PREFIX_KV_CACHE_STORE = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_NPU_USE_TRITON_KV_CACHE_STORE"
