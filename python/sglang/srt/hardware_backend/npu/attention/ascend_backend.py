@@ -16,7 +16,10 @@ from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.ascend_torch_native_backend import (
     AscendTorchNativeAttnBackend,
 )
-from sglang.srt.hardware_backend.npu.attention.mla_cache import gather_mla_cache_pages
+from sglang.srt.hardware_backend.npu.attention.mla_cache import (
+    concat_mla_cache_for_paged_attention,
+    gather_mla_cache_pages,
+)
 from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     is_fia_nz,
     is_mla_preprocess_enabled,
@@ -1659,9 +1662,7 @@ class AscendAttnBackend(AttentionBackend):
             kv = layer.kv_b_proj(kv_cached)[0].view(
                 -1, layer.tp_k_head_num, self.qk_nope_head_dim + layer.v_head_dim
             )
-            k_nope, v_pre = kv.split(
-                [self.qk_nope_head_dim, layer.v_head_dim], dim=-1
-            )
+            k_nope, v_pre = kv.split([self.qk_nope_head_dim, layer.v_head_dim], dim=-1)
 
             k_rope = k_rope_cached.expand(-1, layer.tp_k_head_num, -1)
             k_pre = torch.cat([k_nope, k_rope], dim=-1)
@@ -1705,9 +1706,7 @@ class AscendAttnBackend(AttentionBackend):
                 )
                 q_len_offset += q_len
                 prefix_len_offset += prefix_len
-            attn_output = attn_output.view(
-                -1, layer.tp_q_head_num * layer.v_head_dim
-            )
+            attn_output = attn_output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
         else:
             if layer.qk_head_dim == layer.v_head_dim:
                 """FIA will support multi-bs in the later version of CANN"""
@@ -2096,9 +2095,9 @@ class AscendAttnBackend(AttentionBackend):
                 # V2 consumes it with BNSD queries; keep the cache unchanged.
                 batch_size = len(actual_seq_lengths_kv)
                 query_seq_len = self.speculative_num_draft_tokens
-                assert q_nope.shape[0] == batch_size * query_seq_len, (
-                    "FIAS V2 target verify requires one fixed draft block per request"
-                )
+                assert (
+                    q_nope.shape[0] == batch_size * query_seq_len
+                ), "FIAS V2 target verify requires one fixed draft block per request"
                 if batch_size == 0:
                     attn_output = torch.empty_like(q_nope)
                 else:
@@ -2759,8 +2758,7 @@ class AscendAttnBackend(AttentionBackend):
             kv_c = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
             k_pe = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
 
-            if self.use_fia and (layer.tp_q_head_num // layer.tp_k_head_num) >= 8:
-                """layer.tp_q_head_num // layer.tp_k_head_num < 8 will support in the later version of CANN"""
+            if self.use_fia:
                 if is_fia_nz():
                     kv_c = _reshape_kv_for_fia_nz(
                         kv_c, layer.tp_k_head_num, self.kv_lora_rank, self.page_size
@@ -2829,7 +2827,9 @@ class AscendAttnBackend(AttentionBackend):
                 if q_rope is not None:
                     q = torch.cat([q, q_rope], dim=-1)
                 query = q.view(-1, layer.tp_q_head_num, layer.head_dim)
-                kv_c_and_k_pe_cache = torch.cat([kv_c, k_pe], dim=-1)
+                kv_c_and_k_pe_cache = concat_mla_cache_for_paged_attention(
+                    kv_c, k_pe, is_nz=is_fia_nz()
+                )
                 kv_c_and_k_pe_cache = kv_c_and_k_pe_cache.view(
                     -1,
                     self.page_size,
