@@ -1397,6 +1397,10 @@ class Scheduler(
             page_size=self.page_size,
             device=self.device,
         )
+        # Online calibration publishes through get_next_batch_to_run, so it is
+        # only safe for the null (non-disaggregated) PP event loop.
+        if get_disagg().disaggregation_mode != "null":
+            sizer.disable_online_calibration()
         if sizer.profile_and_fit():
             self.dynamic_chunk_sizer = sizer
 
@@ -3954,6 +3958,11 @@ class Scheduler(
     def get_next_batch_to_run(
         self, running_batch: ScheduleBatch, last_batch: Optional[ScheduleBatch]
     ) -> NextBatchPlan:
+        # Every PP rank calls this once per scheduler iteration, so it is a safe
+        # rendezvous for publishing PP0's online chunk-model coefficients.
+        dynamic_chunk_sizer = getattr(self, "dynamic_chunk_sizer", None)
+        if dynamic_chunk_sizer is not None:
+            dynamic_chunk_sizer.sync_online_model()
         self.process_pending_chunked_abort()
         self._process_hicache_events()
 
@@ -4718,6 +4727,14 @@ class Scheduler(
             for req in batch.reqs:
                 self.maybe_send_cached_prefix_chunk(req, allow_send=not load_pending)
 
+        # Online dynamic-chunk calibration brackets the prefill forward.
+        dynamic_chunk_sizer = getattr(self, "dynamic_chunk_sizer", None)
+        chunk_timing_start = (
+            dynamic_chunk_sizer.begin_forward_timing(batch)
+            if dynamic_chunk_sizer is not None
+            else None
+        )
+
         # Run forward
         if self.is_generation:
             if self.enable_overlap:
@@ -4994,6 +5011,9 @@ class Scheduler(
                 # Result processing finishes the others; a chunked one is
                 # released like a client abort so its next chunk never runs.
                 self._pending_chunked_abort_req = self.chunked_req
+
+        if dynamic_chunk_sizer is not None:
+            dynamic_chunk_sizer.finish_forward_timing(chunk_timing_start, batch)
 
         self._maybe_report_active_ranks()
 

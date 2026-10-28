@@ -654,6 +654,16 @@ class Envs:
     SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION = EnvInt(4096)
     SGLANG_MAX_NEW_TOKENS_LIMIT = EnvInt(None)
     SGLANG_DYNAMIC_CHUNKING_SMOOTH_FACTOR = EnvFloat(0.75)
+    # Online refinement of the dynamic-chunking latency model. The startup
+    # profile can only cover a bounded sequence-length range; during serving we
+    # sample real prefill chunks and re-fit a history-aware model so predictions
+    # stay accurate for longer sequences. Only the first PP rank times forwards;
+    # the fitted coefficients are broadcast to every rank.
+    SGLANG_DYNAMIC_CHUNKING_ONLINE_ENABLE = EnvBool(True)
+    SGLANG_DYNAMIC_CHUNKING_ONLINE_MIN_FIT_CHUNK = EnvInt(5)
+    SGLANG_DYNAMIC_CHUNKING_ONLINE_MAX_FIT_CHUNK = EnvInt(30)
+    SGLANG_DYNAMIC_CHUNKING_ONLINE_TARGET_LATENCY_SAMPLES = EnvInt(3)
+    SGLANG_DYNAMIC_CHUNKING_ONLINE_DEADLINE_S = EnvFloat(600.0)
     # Window for the token-weighted recent cache-hit rate used to estimate
     # waiting-queue prefill load.
     SGLANG_CACHE_HIT_RATE_WINDOW_SECONDS = EnvFloat(15.0)

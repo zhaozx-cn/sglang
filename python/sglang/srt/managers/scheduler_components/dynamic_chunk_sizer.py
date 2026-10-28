@@ -64,6 +64,23 @@ class DynamicChunkSizer:
         self.pp_rank = get_parallel().pp_rank
         self.predictor = ChunkSizePredictor()
 
+        # Online refinement state. Only the first PP rank times forwards; every
+        # rank applies the broadcast coefficients so chunk decisions stay
+        # identical across pipeline stages.
+        self.min_fit_chunk = envs.SGLANG_DYNAMIC_CHUNKING_ONLINE_MIN_FIT_CHUNK.get()
+        self.max_fit_chunk = envs.SGLANG_DYNAMIC_CHUNKING_ONLINE_MAX_FIT_CHUNK.get()
+        self.target_latency_samples = (
+            envs.SGLANG_DYNAMIC_CHUNKING_ONLINE_TARGET_LATENCY_SAMPLES.get()
+        )
+        self.online_deadline_s = envs.SGLANG_DYNAMIC_CHUNKING_ONLINE_DEADLINE_S.get()
+        self.online_active = envs.SGLANG_DYNAMIC_CHUNKING_ONLINE_ENABLE.get()
+        self._online_sync_enabled = self.online_active
+        self._online_started_at = time.monotonic()
+        self._target_latency_sample_count = 0
+        self._target_latency_done = not self.online_active
+        self._online_coefficients_dirty = False
+        self.chunked_fit_data: List[List[float]] = []
+
     def profile_and_fit(self) -> bool:
         """PP0 profiles synthetic prefills and every rank fits the same samples;
         returns whether the predictor is ready."""
@@ -102,9 +119,11 @@ class DynamicChunkSizer:
             return False
         self.predictor.set_target_latency(self.chunked_prefill_size)
         self.predictor.is_ready = True
+        self._online_started_at = time.monotonic()
         logger.info(
             f"[PP Dynamic Chunk] [PP{self.pp_rank}] Predictor ready (quadratic). "
-            f"Target latency: {self.predictor.target_latency:.2f}ms"
+            f"Target latency: {self.predictor.target_latency:.2f}ms, "
+            f"online calibration: {self.online_active}"
         )
         return True
 
@@ -114,21 +133,165 @@ class DynamicChunkSizer:
             return None
 
         max_chunk_size = self.max_prefill_tokens
+        use_history = self.predictor.with_history_ready
         predicted_size = self.predictor.predict_next_chunk_size(
             history_len=history_len,
             base_chunk_size=self.chunked_prefill_size,
             page_size=self.page_size,
             context_len=self.model_config.context_len,
             max_chunk_size=max_chunk_size,
+            use_history=use_history,
         )
 
         if predicted_size is not None:
             logger.debug(
                 f"[PP Dynamic Chunk] [PP{self.pp_rank}] Predicted chunk size: "
-                f"{predicted_size} (history_len={history_len})"
+                f"{predicted_size} (history_len={history_len}, "
+                f"history_model={use_history})"
             )
 
         return predicted_size
+
+    # ------------------------------------------------------------------
+    # Online calibration
+    # ------------------------------------------------------------------
+
+    def disable_online_calibration(self) -> None:
+        """Keep the startup-fitted model (e.g. for event loops without a sync point)."""
+        self.online_active = False
+        self._online_sync_enabled = False
+        self._target_latency_done = True
+
+    def begin_forward_timing(self, batch: ScheduleBatch) -> Optional[float]:
+        """Start timing a real prefill forward on PP0, if calibration is active."""
+        if not self._should_time_forward(batch):
+            return None
+        get_device_module().synchronize()
+        return time.perf_counter()
+
+    def finish_forward_timing(
+        self, start: Optional[float], batch: ScheduleBatch
+    ) -> None:
+        """Record the prefill latency measured since ``begin_forward_timing``."""
+        if start is None or not batch.forward_mode.is_extend():
+            return
+        get_device_module().synchronize()
+        elapsed_ms = (time.perf_counter() - start) * 1e3
+        self._record_batch_execution_time(batch, elapsed_ms)
+
+    def _should_time_forward(self, batch: ScheduleBatch) -> bool:
+        return (
+            self.online_active
+            and self.predictor.is_ready
+            and self.pp_rank == 0
+            and batch.forward_mode.is_extend()
+        )
+
+    def _record_batch_execution_time(
+        self, batch: ScheduleBatch, elapsed_ms: float
+    ) -> None:
+        if not batch.extend_lens or not batch.prefix_lens:
+            return
+
+        decoding_rids = {req.rid for req in (batch.decoding_reqs or [])}
+        chunks = [
+            (int(chunk), int(history))
+            for req, chunk, history in zip(
+                batch.reqs, batch.extend_lens, batch.prefix_lens
+            )
+            if req.rid not in decoding_rids and chunk > 0
+        ]
+        if not chunks:
+            return
+
+        # Re-calibrate the target from single first-chunk prefills, whose
+        # latency is directly comparable to the per-request startup samples.
+        if not self._target_latency_done and len(chunks) == 1 and chunks[0][1] == 0:
+            self.predictor.set_target_latency(
+                self.chunked_prefill_size, elapsed_time=elapsed_ms
+            )
+            self._target_latency_sample_count += 1
+            self._online_coefficients_dirty = True
+            if self._target_latency_sample_count >= self.target_latency_samples:
+                self._target_latency_done = True
+
+        # f(C, H) = a*C*(C+H) + b*(C+H) + c for the whole batch, so a batch
+        # sample is the sum over its requests.
+        x1 = sum((chunk + history) * chunk for chunk, history in chunks)
+        x2 = sum(chunk + history for chunk, history in chunks)
+        x3 = len(chunks)
+        self.chunked_fit_data.append([x1, x2, x3, elapsed_ms])
+
+        if self.predictor.fit_chunk(
+            self.chunked_fit_data,
+            min_points=self.min_fit_chunk,
+            max_points=self.max_fit_chunk,
+        ):
+            self.predictor.with_history_ready = True
+            self._online_coefficients_dirty = True
+
+        if self.predictor.history_fitted:
+            self.online_active = False
+            self._online_coefficients_dirty = True
+            logger.info(
+                f"[PP Dynamic Chunk] [PP{self.pp_rank}] Online calibration "
+                f"finished after {len(self.chunked_fit_data)} samples"
+            )
+
+    def sync_online_model(self) -> None:
+        """Broadcast PP0's fitted history model to every rank.
+
+        Called once per scheduler iteration by every rank while calibration is
+        active. PP0 is the only rank that measures forwards; broadcasting the
+        coefficients keeps the per-rank chunk predictions identical.
+        """
+        if not self._online_sync_enabled or not self.predictor.is_ready:
+            return
+
+        parallel = get_parallel()
+        if self.pp_rank == 0 and (
+            self.online_active
+            and self.online_deadline_s > 0
+            and time.monotonic() - self._online_started_at >= self.online_deadline_s
+        ):
+            self.online_active = False
+            self._online_coefficients_dirty = True
+            logger.info(
+                "[PP Dynamic Chunk] Online calibration deadline reached; "
+                "keeping the startup-fitted model."
+            )
+
+        payload = None
+        if parallel.pp_group.is_first_rank and (
+            self._online_coefficients_dirty or not self.online_active
+        ):
+            payload = (
+                self.predictor.quadratic_chunk_a,
+                self.predictor.linear_chunk_b,
+                self.predictor.constant_chunk_c,
+                self.predictor.with_history_ready,
+                self.predictor.target_latency,
+                self.online_active,
+            )
+            self._online_coefficients_dirty = False
+
+        world_group = parallel.world_group
+        payload = broadcast_pyobj(
+            [payload], world_group.rank, world_group.cpu_group, src=0
+        )[0]
+
+        if payload is not None:
+            (
+                self.predictor.quadratic_chunk_a,
+                self.predictor.linear_chunk_b,
+                self.predictor.constant_chunk_c,
+                self.predictor.with_history_ready,
+                self.predictor.target_latency,
+                self.online_active,
+            ) = payload
+
+        if not self.online_active:
+            self._online_sync_enabled = False
 
     def _profile_prefill_latency(self) -> Tuple[List[int], List[float]]:
         from sglang.srt.model_executor.runner_utils.buffers import (
@@ -266,12 +429,22 @@ class DynamicChunkSizer:
 
 class ChunkSizePredictor:
     """Quadratic latency model f(l) = a*l^2 + b*l + c; predicts the chunk x with
-    f(L + x) - f(L) = target_latency."""
+    f(L + x) - f(L) = target_latency.
+
+    The online model f(C, H) = a*C*(C+H) + b*(C+H) + c additionally captures the
+    prefix length H, so it can be re-fitted from real serving batches.
+    """
 
     def __init__(self):
         self.quadratic_coeff_a = 0.0
         self.linear_coeff_b = 0.0
         self.constant_coeff_c = 0.0
+        # History-aware online model: f(C, H) = a*C*(C+H) + b*(C+H) + c.
+        self.quadratic_chunk_a = 0.0
+        self.linear_chunk_b = 0.0
+        self.constant_chunk_c = 0.0
+        self.with_history_ready = False
+        self.history_fitted = False
         self.target_latency: Optional[float] = None
         self.is_ready = False
 
@@ -324,8 +497,12 @@ class ChunkSizePredictor:
             f"b={fitted_b:.2e}, c={fitted_c:.2e}"
         )
 
-    def set_target_latency(self, base_chunk_size: int):
-        """Set target latency based on base chunk size: target = f(base_chunk_size) - f(0)."""
+    def set_target_latency(self, base_chunk_size: int, elapsed_time: float = 0.0):
+        """Set target latency based on base chunk size: target = f(base_chunk_size) - f(0).
+
+        When ``elapsed_time`` is positive it comes from a real prefill batch and
+        replaces the profiled estimate.
+        """
 
         def f(length: float) -> float:
             """Total latency function: f(length) = a*length^2 + b*length + c."""
@@ -335,7 +512,10 @@ class ChunkSizePredictor:
                 + self.constant_coeff_c
             )
 
-        self.target_latency = f(float(base_chunk_size)) - f(0.0)
+        if elapsed_time > 0:
+            self.target_latency = elapsed_time
+        else:
+            self.target_latency = f(float(base_chunk_size)) - f(0.0)
 
         if self.target_latency <= 0:
             raise ValueError(
@@ -348,6 +528,64 @@ class ChunkSizePredictor:
             f"(base_chunk_size={base_chunk_size})"
         )
 
+    def fit_chunk(
+        self,
+        chunked_data: List[List[float]],
+        min_points: int,
+        max_points: int,
+    ) -> bool:
+        """Fit the history-aware model from aggregated batch samples.
+
+        Each row is ``[sum(C*(C+H)), sum(C+H), num_reqs, elapsed_ms]``, so the
+        model is ``T = a*x1 + b*x2 + c*x3``.
+        """
+        num_points = len(chunked_data)
+        if num_points < min_points:
+            return False
+        if num_points > max_points:
+            self.history_fitted = True
+            return False
+
+        data = np.asarray(chunked_data, dtype=np.float64)
+        execute_time = data[:, -1]
+        input_x = data[:, :-1]
+
+        try:
+            params, _, _, _ = np.linalg.lstsq(input_x, execute_time, rcond=None)
+        except np.linalg.LinAlgError as e:
+            logger.warning(f"[ChunkSizePredictor] Failed to fit chunked model: {e}")
+            return False
+
+        fitted_a, fitted_b, fitted_c = (float(v) for v in params)
+        if fitted_a <= 0:
+            logger.warning(
+                f"[ChunkSizePredictor] Refusing history model with "
+                f"a={fitted_a:.2e} <= 0"
+            )
+            return False
+
+        self.quadratic_chunk_a = fitted_a
+        self.linear_chunk_b = fitted_b
+        self.constant_chunk_c = fitted_c
+
+        logger.info(
+            f"[ChunkSizePredictor] Fitted history model from {num_points} samples: "
+            f"a={fitted_a:.2e}, b={fitted_b:.2e}, c={fitted_c:.2e}"
+        )
+        return True
+
+    def get_time_with_history(
+        self,
+        query_len: int,
+        num_computed_tokens: int,
+    ) -> float:
+        """Latency of a chunk ``query_len`` with ``num_computed_tokens`` history."""
+        return (
+            self.quadratic_chunk_a * query_len * (query_len + num_computed_tokens)
+            + self.linear_chunk_b * (query_len + num_computed_tokens)
+            + self.constant_chunk_c
+        )
+
     def predict_next_chunk_size(
         self,
         history_len: int,
@@ -355,20 +593,35 @@ class ChunkSizePredictor:
         page_size: int,
         context_len: int,
         max_chunk_size: Optional[int] = None,
+        use_history: bool = False,
     ) -> Optional[int]:
         """Chunk size x with f(L + x) - f(L) = target_latency for L = history_len,
-        or None when the model cannot say."""
+        or None when the model cannot say.
+
+        With ``use_history`` the online model f(x, L) is solved directly.
+        """
         if not self.is_ready or self.target_latency is None:
             return None
 
-        # Handle quadratic model: f(l) = al^2 + bl + c
-        if self.quadratic_coeff_a <= 0:
-            return None
-
-        # f(L+x) - f(L) = T expands to a*x^2 + (2aL + b)*x - T = 0.
-        A = self.quadratic_coeff_a
-        B = 2 * self.quadratic_coeff_a * history_len + self.linear_coeff_b
-        C = -self.target_latency
+        if use_history:
+            if not self.with_history_ready or self.quadratic_chunk_a <= 0:
+                return None
+            # f(x, H) = a*x*(x+H) + b*(x+H) + c = T expands to
+            # a*x^2 + (a*H + b)*x + (b*H + c - T) = 0.
+            A = self.quadratic_chunk_a
+            B = A * history_len + self.linear_chunk_b
+            C = (
+                self.linear_chunk_b * history_len
+                + self.constant_chunk_c
+                - self.target_latency
+            )
+        else:
+            if self.quadratic_coeff_a <= 0:
+                return None
+            # f(L+x) - f(L) = T expands to a*x^2 + (2aL + b)*x - T = 0.
+            A = self.quadratic_coeff_a
+            B = 2 * self.quadratic_coeff_a * history_len + self.linear_coeff_b
+            C = -self.target_latency
 
         discriminant = B * B - 4 * A * C
 
