@@ -233,6 +233,9 @@ from sglang.srt.managers.scheduler_components.dp_attn import SchedulerDPAttnAdap
 from sglang.srt.managers.scheduler_components.dynamic_chunk_sizer import (
     DynamicChunkSizer,
 )
+from sglang.srt.managers.scheduler_components.pp_chunk_model_update import (
+    PPChunkModelUpdate,
+)
 from sglang.srt.managers.scheduler_components.flush_wrapper import SchedulerFlushWrapper
 from sglang.srt.managers.scheduler_components.idle_sleeper import (
     IdleSleeper,
@@ -2208,8 +2211,20 @@ class Scheduler(
         ):
             local_reqs = self._poll_timeout_aborts()
         recv_start_ns = time.monotonic_ns()
+        extra_reqs = None
+        dynamic_chunk_sizer = getattr(self, "dynamic_chunk_sizer", None)
+        if (
+            dynamic_chunk_sizer is not None
+            and getattr(dynamic_chunk_sizer, "is_pp_chunk_leader", False)
+            and getattr(dynamic_chunk_sizer, "online_enabled", False)
+        ):
+            update = dynamic_chunk_sizer.export_online_update()
+            if update is not None:
+                extra_reqs = [update]
         self._deferred_input_requests.extend(
-            self.request_receiver.recv_requests(local_reqs=local_reqs)
+            self.request_receiver.recv_requests(
+                local_reqs=local_reqs, extra_reqs=extra_reqs
+            )
         )
 
         num_requests_to_process = len(self._deferred_input_requests)
@@ -2221,11 +2236,28 @@ class Scheduler(
         recv_reqs = self._deferred_input_requests[:num_requests_to_process]
         del self._deferred_input_requests[:num_requests_to_process]
 
+        recv_reqs = self._consume_pp_chunk_model_updates(recv_reqs)
+
         if recv_reqs:
             # Count successful receive/broadcast time as active; empty polls stay idle.
             self.metrics_reporter.record_scheduler_active(recv_start_ns)
         self.process_input_requests(recv_reqs)
         return recv_reqs
+
+    def _consume_pp_chunk_model_updates(self, recv_reqs: List) -> List:
+        """Strip model updates from a PP request batch and apply the newest."""
+        if not recv_reqs:
+            return recv_reqs
+        updates = [req for req in recv_reqs if isinstance(req, PPChunkModelUpdate)]
+        if not updates:
+            return recv_reqs
+        dynamic_chunk_sizer = getattr(self, "dynamic_chunk_sizer", None)
+        if dynamic_chunk_sizer is not None:
+            # Apply each; the sizer ignores stale versions and updates from
+            # other DP replicas.
+            for update in updates:
+                dynamic_chunk_sizer.apply_online_update(update)
+        return [req for req in recv_reqs if not isinstance(req, PPChunkModelUpdate)]
 
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_REQUESTS)
     def process_input_requests(self, recv_reqs: List):
@@ -3958,11 +3990,6 @@ class Scheduler(
     def get_next_batch_to_run(
         self, running_batch: ScheduleBatch, last_batch: Optional[ScheduleBatch]
     ) -> NextBatchPlan:
-        # Every PP rank calls this once per scheduler iteration, so it is a safe
-        # rendezvous for publishing PP0's online chunk-model coefficients.
-        dynamic_chunk_sizer = getattr(self, "dynamic_chunk_sizer", None)
-        if dynamic_chunk_sizer is not None:
-            dynamic_chunk_sizer.sync_online_model()
         self.process_pending_chunked_abort()
         self._process_hicache_events()
 

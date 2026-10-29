@@ -658,7 +658,7 @@ class Envs:
     # profile can only cover a bounded sequence-length range; during serving we
     # sample real prefill chunks and re-fit a history-aware model so predictions
     # stay accurate for longer sequences. Only the first PP rank times forwards;
-    # the fitted coefficients are broadcast to every rank.
+    # the fitted coefficients travel with the PP request stream to every stage.
     SGLANG_DYNAMIC_CHUNKING_ONLINE_ENABLE = EnvBool(True)
     SGLANG_DYNAMIC_CHUNKING_ONLINE_MIN_FIT_CHUNK = EnvInt(5)
     SGLANG_DYNAMIC_CHUNKING_ONLINE_MAX_FIT_CHUNK = EnvInt(30)

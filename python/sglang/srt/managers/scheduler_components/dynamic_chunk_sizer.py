@@ -16,6 +16,9 @@ from sglang.srt.layers.dp_attention import (
     set_is_extend_in_batch,
 )
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.managers.scheduler_components.pp_chunk_model_update import (
+    PPChunkModelUpdate,
+)
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.runtime_context import get_parallel
@@ -61,24 +64,32 @@ class DynamicChunkSizer:
         self.max_prefill_tokens = max_prefill_tokens
         self.page_size = page_size
         self.device = device
-        self.pp_rank = get_parallel().pp_rank
+        parallel = get_parallel()
+        self.pp_rank = parallel.pp_rank
+        # Only one rank per PP stage owns the online model; the rest receive the
+        # update through the existing in-stage request broadcast.
+        self.is_pp_chunk_leader = (
+            self.pp_rank == 0
+            and parallel.attn_tp_rank == 0
+            and parallel.attn_cp_rank == 0
+        )
         self.predictor = ChunkSizePredictor()
 
-        # Online refinement state. Only the first PP rank times forwards; every
-        # rank applies the broadcast coefficients so chunk decisions stay
-        # identical across pipeline stages.
+        # Online refinement state. Only the first PP rank times forwards. The
+        # fitted state travels stage to stage with the existing PP request
+        # sends, so chunk decisions stay identical without a new collective.
         self.min_fit_chunk = envs.SGLANG_DYNAMIC_CHUNKING_ONLINE_MIN_FIT_CHUNK.get()
         self.max_fit_chunk = envs.SGLANG_DYNAMIC_CHUNKING_ONLINE_MAX_FIT_CHUNK.get()
         self.target_latency_samples = (
             envs.SGLANG_DYNAMIC_CHUNKING_ONLINE_TARGET_LATENCY_SAMPLES.get()
         )
         self.online_deadline_s = envs.SGLANG_DYNAMIC_CHUNKING_ONLINE_DEADLINE_S.get()
-        self.online_active = envs.SGLANG_DYNAMIC_CHUNKING_ONLINE_ENABLE.get()
-        self._online_sync_enabled = self.online_active
+        self.online_enabled = envs.SGLANG_DYNAMIC_CHUNKING_ONLINE_ENABLE.get()
+        self.online_active = self.online_enabled
         self._online_started_at = time.monotonic()
         self._target_latency_sample_count = 0
         self._target_latency_done = not self.online_active
-        self._online_coefficients_dirty = False
+        self._model_version = 0
         self.chunked_fit_data: List[List[float]] = []
 
     def profile_and_fit(self) -> bool:
@@ -157,10 +168,65 @@ class DynamicChunkSizer:
     # ------------------------------------------------------------------
 
     def disable_online_calibration(self) -> None:
-        """Keep the startup-fitted model (e.g. for event loops without a sync point)."""
+        """Keep the startup-fitted model (e.g. for event loops without update transport)."""
+        self.online_enabled = False
         self.online_active = False
-        self._online_sync_enabled = False
         self._target_latency_done = True
+
+    def _mark_model_updated(self) -> None:
+        self._model_version += 1
+
+    def _maybe_expire_online(self) -> None:
+        if (
+            self.is_pp_chunk_leader
+            and self.online_active
+            and self.online_deadline_s > 0
+            and time.monotonic() - self._online_started_at >= self.online_deadline_s
+        ):
+            self.online_active = False
+            self._target_latency_done = True
+            self._mark_model_updated()
+            logger.info(
+                "[PP Dynamic Chunk] Online calibration deadline reached; "
+                "keeping the fitted model."
+            )
+
+    def export_online_update(self) -> Optional[PPChunkModelUpdate]:
+        """Current model state to attach to this stage's outgoing request send."""
+        if not self.online_enabled or not self.predictor.is_ready:
+            return None
+        self._maybe_expire_online()
+        return PPChunkModelUpdate(
+            version=self._model_version,
+            quadratic_chunk_a=self.predictor.quadratic_chunk_a,
+            linear_chunk_b=self.predictor.linear_chunk_b,
+            constant_chunk_c=self.predictor.constant_chunk_c,
+            with_history_ready=self.predictor.with_history_ready,
+            target_latency=self.predictor.target_latency,
+            online_active=self.online_active,
+            origin_dp_rank=get_parallel().attn_dp_rank,
+        )
+
+    def apply_online_update(self, update: PPChunkModelUpdate) -> None:
+        """Apply a newer model state received from the previous PP stage."""
+        if update.origin_dp_rank != get_parallel().attn_dp_rank:
+            return
+        if update.version <= self._model_version:
+            return
+
+        self.predictor.quadratic_chunk_a = update.quadratic_chunk_a
+        self.predictor.linear_chunk_b = update.linear_chunk_b
+        self.predictor.constant_chunk_c = update.constant_chunk_c
+        self.predictor.with_history_ready = update.with_history_ready
+        self.predictor.target_latency = update.target_latency
+        self.online_active = update.online_active
+        self._model_version = update.version
+        if not self.online_active:
+            self._target_latency_done = True
+        logger.debug(
+            f"[PP Dynamic Chunk] [PP{self.pp_rank}] Applied online update "
+            f"v{update.version}"
+        )
 
     def begin_forward_timing(self, batch: ScheduleBatch) -> Optional[float]:
         """Start timing a real prefill forward on PP0, if calibration is active."""
@@ -183,7 +249,7 @@ class DynamicChunkSizer:
         return (
             self.online_active
             and self.predictor.is_ready
-            and self.pp_rank == 0
+            and self.is_pp_chunk_leader
             and batch.forward_mode.is_extend()
         )
 
@@ -211,7 +277,7 @@ class DynamicChunkSizer:
                 self.chunked_prefill_size, elapsed_time=elapsed_ms
             )
             self._target_latency_sample_count += 1
-            self._online_coefficients_dirty = True
+            self._mark_model_updated()
             if self._target_latency_sample_count >= self.target_latency_samples:
                 self._target_latency_done = True
 
@@ -228,70 +294,16 @@ class DynamicChunkSizer:
             max_points=self.max_fit_chunk,
         ):
             self.predictor.with_history_ready = True
-            self._online_coefficients_dirty = True
+            self._mark_model_updated()
 
         if self.predictor.history_fitted:
             self.online_active = False
-            self._online_coefficients_dirty = True
+            self._target_latency_done = True
+            self._mark_model_updated()
             logger.info(
                 f"[PP Dynamic Chunk] [PP{self.pp_rank}] Online calibration "
                 f"finished after {len(self.chunked_fit_data)} samples"
             )
-
-    def sync_online_model(self) -> None:
-        """Broadcast PP0's fitted history model to every rank.
-
-        Called once per scheduler iteration by every rank while calibration is
-        active. PP0 is the only rank that measures forwards; broadcasting the
-        coefficients keeps the per-rank chunk predictions identical.
-        """
-        if not self._online_sync_enabled or not self.predictor.is_ready:
-            return
-
-        parallel = get_parallel()
-        if self.pp_rank == 0 and (
-            self.online_active
-            and self.online_deadline_s > 0
-            and time.monotonic() - self._online_started_at >= self.online_deadline_s
-        ):
-            self.online_active = False
-            self._online_coefficients_dirty = True
-            logger.info(
-                "[PP Dynamic Chunk] Online calibration deadline reached; "
-                "keeping the startup-fitted model."
-            )
-
-        payload = None
-        if parallel.pp_group.is_first_rank and (
-            self._online_coefficients_dirty or not self.online_active
-        ):
-            payload = (
-                self.predictor.quadratic_chunk_a,
-                self.predictor.linear_chunk_b,
-                self.predictor.constant_chunk_c,
-                self.predictor.with_history_ready,
-                self.predictor.target_latency,
-                self.online_active,
-            )
-            self._online_coefficients_dirty = False
-
-        world_group = parallel.world_group
-        payload = broadcast_pyobj(
-            [payload], world_group.rank, world_group.cpu_group, src=0
-        )[0]
-
-        if payload is not None:
-            (
-                self.predictor.quadratic_chunk_a,
-                self.predictor.linear_chunk_b,
-                self.predictor.constant_chunk_c,
-                self.predictor.with_history_ready,
-                self.predictor.target_latency,
-                self.online_active,
-            ) = payload
-
-        if not self.online_active:
-            self._online_sync_enabled = False
 
     def _profile_prefill_latency(self) -> Tuple[List[int], List[float]]:
         from sglang.srt.model_executor.runner_utils.buffers import (

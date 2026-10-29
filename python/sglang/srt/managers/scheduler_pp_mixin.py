@@ -139,9 +139,15 @@ class SchedulerPPMixin:
                     recv_reqs = self.ingest_requests()
                 if not self.pp_group.is_last_rank:
                     self._pp_commit_comm_work(self.send_req_work)
+                    send_reqs = recv_reqs
+                    dynamic_chunk_sizer = getattr(self, "dynamic_chunk_sizer", None)
+                    if dynamic_chunk_sizer is not None:
+                        update = dynamic_chunk_sizer.export_online_update()
+                        if update is not None:
+                            send_reqs = [*recv_reqs, update]
                     with torch.profiler.record_function("send_reqs_to_next_stage"):
                         self.send_req_work = self._pp_send_pyobj_to_next_stage(
-                            recv_reqs,
+                            send_reqs,
                             async_send=True,
                         )
                 with torch.profiler.record_function("get_next_batch_to_run"):

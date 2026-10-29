@@ -34,6 +34,9 @@ from sglang.srt.managers.mm_utils import (
     has_shm_features,
     unwrap_shm_features,
 )
+from sglang.srt.managers.scheduler_components.pp_chunk_model_update import (
+    PPChunkModelUpdate,
+)
 from sglang.srt.managers.scheduler_components.shm_tag_exchange import (
     ShmTagExchange,
     get_shm_exchange,
@@ -83,12 +86,16 @@ class SchedulerRequestReceiver:
 
     @scheduler_stage_method(SCHEDULER_STAGE_RECV_REQUESTS)
     def recv_requests(
-        self, local_reqs: Optional[List[AbortReq]] = None
+        self,
+        local_reqs: Optional[List[AbortReq]] = None,
+        extra_reqs: Optional[List] = None,
     ) -> List[Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput, Any]]:
         """Receive results at tp_rank = 0 and broadcast it to all other TP ranks.
 
         local_reqs are aborts the caller decided on this rank; they ride the
-        same broadcast as the pulled requests.
+        same broadcast as the pulled requests. extra_reqs ride the same
+        broadcast and carry stage-local metadata such as dynamic-chunk model
+        updates.
         """
 
         if self.scripted_scheduler_hook is not None:
@@ -99,6 +106,13 @@ class SchedulerRequestReceiver:
                 return []
 
         recv_reqs = self._pull_raw_reqs()
+
+        if (
+            extra_reqs
+            and get_parallel().attn_tp_rank == 0
+            and get_parallel().attn_cp_rank == 0
+        ):
+            recv_reqs = [*(recv_reqs or []), *extra_reqs]
 
         if self.input_blocker is not None:
             recv_reqs = self.input_blocker.handle(recv_reqs)
@@ -319,32 +333,15 @@ class SchedulerRequestReceiver:
                 req.mm_inputs = error
 
     def _split_work_and_control_reqs(self, recv_reqs: List):
-        work_reqs = [
-            req
-            for req in recv_reqs
-            if isinstance(
-                req,
-                (
-                    TokenizedGenerateReqInput,
-                    TokenizedEmbeddingReqInput,
-                    BatchTokenizedGenerateReqInput,
-                    BatchTokenizedEmbeddingReqInput,
-                ),
-            )
-        ]
-        control_reqs = [
-            req
-            for req in recv_reqs
-            if not isinstance(
-                req,
-                (
-                    TokenizedGenerateReqInput,
-                    TokenizedEmbeddingReqInput,
-                    BatchTokenizedGenerateReqInput,
-                    BatchTokenizedEmbeddingReqInput,
-                ),
-            )
-        ]
+        work_types = (
+            TokenizedGenerateReqInput,
+            TokenizedEmbeddingReqInput,
+            BatchTokenizedGenerateReqInput,
+            BatchTokenizedEmbeddingReqInput,
+            PPChunkModelUpdate,
+        )
+        work_reqs = [req for req in recv_reqs if isinstance(req, work_types)]
+        control_reqs = [req for req in recv_reqs if not isinstance(req, work_types)]
         return work_reqs, control_reqs
 
 
