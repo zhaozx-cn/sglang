@@ -208,8 +208,8 @@ def fused_recurrent_linear_replayssm_decode_kernel(
     b_state_q = tl.zeros([BV], dtype=tl.float32)
     b_state_k = tl.zeros([BV], dtype=tl.float32)
     cur_kq = tl.zeros([1], dtype=tl.float32)
-    write_k = (not b_is_flush) and (i_v == 0) and (i_hv == i_h * (HV // H))
-    write_g_kda = IS_KDA and (not b_is_flush) and (i_v == 0)
+    write_k = ((b_is_flush == 0) & (i_v == 0)) & (i_hv == i_h * (HV // H))
+    write_g_kda = (b_is_flush == 0) & (i_v == 0) if IS_KDA else False
     for kk in range(NK):
         o_kt = kk * BKT + tl.arange(0, BKT)
         mask_kt = o_kt < K

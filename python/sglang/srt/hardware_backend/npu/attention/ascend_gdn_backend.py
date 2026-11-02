@@ -8,6 +8,9 @@ from sgl_kernel_npu.fla.fused_gdn_gating import (
 from sgl_kernel_npu.fla.l2norm import l2norm_fwd
 from sgl_kernel_npu.fla.utils import prepare_chunk_indices
 
+from sglang.kernels.ops.attention.linear.fused_recurrent_linear_replayssm import (
+    fused_recurrent_gdn_replayssm_decode,
+)
 from sglang.srt.hardware_backend.npu.attention.ascend_hybrid_linear_attn_backend import (
     AscendMambaAttnBackendBase,
 )
@@ -111,6 +114,57 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
             layer._conv_weights_t = w
         return w
 
+    def _replayssm_decode(
+        self,
+        layer: RadixLinearAttention,
+        forward_batch: ForwardBatch,
+        mixed_qkv: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        layer_cache: MambaPool.State,
+        ssm_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        """Run the ReplaySSM buffered decode when the ring is active.
+
+        The ring cursor and forced-flush mask come from the forward metadata
+        prepared by ``MambaAttnBackendBase`` (eager) or the Ascend graph
+        metadata below. The kernel is the same Triton implementation used on
+        CUDA, so the GDN ring layout is shared across platforms.
+        """
+        replayssm_d = layer_cache.replayssm_d
+        replayssm_k = layer_cache.replayssm_k
+        replayssm_g = layer_cache.replayssm_g
+        write_pos = getattr(self.forward_metadata, "replayssm_write_pos", None)
+        if (
+            replayssm_d is None
+            or replayssm_k is None
+            or replayssm_g is None
+            or write_pos is None
+        ):
+            return None
+
+        bs = forward_batch.batch_size
+        out = mixed_qkv.new_empty(bs, 1, layer.num_v_heads, layer.head_v_dim)
+        fused_recurrent_gdn_replayssm_decode(
+            mixed_qkv=mixed_qkv,
+            a=a,
+            b=b,
+            A_log=layer.A_log,
+            dt_bias=layer.dt_bias,
+            scale=layer.head_k_dim**-0.5,
+            initial_state=ssm_states,
+            d_cache=replayssm_d,
+            k_cache=replayssm_k,
+            g_cache=replayssm_g,
+            out=out,
+            ssm_state_indices=cache_indices,
+            write_pos=write_pos,
+            force_flush=getattr(self.forward_metadata, "replayssm_force_flush", None),
+            use_qk_l2norm_in_kernel=True,
+        )
+        return out.transpose(0, 1)
+
     def forward_decode(
         self,
         layer: RadixLinearAttention,
@@ -138,6 +192,22 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
             pad_slot_id=-1,
             run_mode=1,
         )
+
+        core_attn_out = self._replayssm_decode(
+            layer,
+            forward_batch,
+            mixed_qkv,
+            a,
+            b,
+            layer_cache,
+            ssm_states,
+            cache_indices,
+        )
+        if core_attn_out is not None:
+            self._track_mamba_state_decode(
+                forward_batch, conv_states, ssm_states, cache_indices
+            )
+            return core_attn_out
 
         query, key, value = torch.split(
             mixed_qkv,

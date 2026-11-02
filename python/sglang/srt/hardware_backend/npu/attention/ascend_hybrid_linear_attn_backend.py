@@ -33,12 +33,31 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
             f"max_num_tokens={max_num_tokens} must be divisible by max_bs={max_bs}"
         )
         draft_token_num = max_num_tokens // max_bs
+        # Static per-bs ReplaySSM decode-ring cursors, captured by pointer and
+        # refreshed in place before each graph replay. None when the flag is off.
+        self.replayssm_write_pos_list = [] if self._replayssm_enabled() else None
+        self.replayssm_force_flush_list = [] if self._replayssm_enabled() else None
+        self.replayssm_ring_indices_list = (
+            [] if self._replayssm_request_ring() else None
+        )
         for i in range(max_bs):
             self.state_indices_list.append(
                 torch.full(
                     (i + 1,), self.pad_slot_id, dtype=torch.int32, device=self.device
                 )
             )
+            if self.replayssm_write_pos_list is not None:
+                self.replayssm_write_pos_list.append(
+                    torch.zeros((i + 1,), dtype=torch.int32, device=self.device)
+                )
+            if self.replayssm_force_flush_list is not None:
+                self.replayssm_force_flush_list.append(
+                    torch.zeros((i + 1,), dtype=torch.int32, device=self.device)
+                )
+            if self.replayssm_ring_indices_list is not None:
+                self.replayssm_ring_indices_list.append(
+                    torch.full((i + 1,), -1, dtype=torch.int32, device=self.device)
+                )
             self.state_indices_list_gdn.append(
                 torch.full(
                     ((i + 1) * draft_token_num,),
@@ -104,6 +123,18 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
         else:
             raise ValueError(f"Invalid forward mode: {forward_mode=}")
 
+        replayssm_write_pos = (
+            self.replayssm_write_pos_list[bs - 1]
+            if self.replayssm_write_pos_list is not None
+            else None
+        )
+        replayssm_force_flush = (
+            self.replayssm_force_flush_list[bs - 1]
+            if self.replayssm_force_flush_list is not None
+            else None
+        )
+        replayssm_ring_indices = self._fill_replayssm_ring_indices(bs, req_pool_indices)
+
         # If topk > 1, we need to use retrieve_next_token and retrieve_next_sibling to handle the eagle tree custom attention mask
         if forward_mode.is_target_verify() and spec_info.topk > 1:
             # They are None during cuda graph capture so skip the copy_...
@@ -115,13 +146,92 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
                 retrieve_next_token=self.retrieve_next_token_list[bs - 1],
                 retrieve_next_sibling=self.retrieve_next_sibling_list[bs - 1],
                 retrieve_parent_token=self.retrieve_parent_token_list[bs - 1],
+                replayssm_write_pos=replayssm_write_pos,
+                replayssm_force_flush=replayssm_force_flush,
+                replayssm_ring_indices=replayssm_ring_indices,
             )
         else:
             return ForwardMetadata(
                 query_start_loc=self.query_start_loc_list[bs - 1],
                 mamba_cache_indices=self.state_indices_list[bs - 1],
                 mamba_cache_indices_gdn=self.state_indices_list_gdn[bs - 1],
+                replayssm_write_pos=replayssm_write_pos,
+                replayssm_force_flush=replayssm_force_flush,
+                replayssm_ring_indices=replayssm_ring_indices,
             )
+
+    def _prepare_replayssm_replay_metadata(
+        self,
+        bs: int,
+        req_pool_indices: torch.Tensor,
+        mamba_indices: torch.Tensor,
+        forward_mode: ForwardMode,
+        seq_lens_cpu: Optional[torch.Tensor],
+        num_padding: int,
+        in_capture: bool,
+    ):
+        """Mirror the CUDA ring-cursor refresh/advance for an Ascend graph replay.
+
+        The pool owns the live per-slot cursor; the captured kernel reads the
+        static per-bs buffer, which is refreshed in place before each replay.
+        Advance only on a real decode/idle replay, never during capture or
+        target verify.
+        """
+        ring_indices = self._fill_replayssm_ring_indices(
+            bs, req_pool_indices, num_padding
+        )
+        if self.replayssm_write_pos_list is None:
+            return None, None, ring_indices
+
+        mamba_pool = self.state_pool
+        write_pos_buf = mamba_pool.replayssm_write_pos
+        static_wp = self.replayssm_write_pos_list[bs - 1]
+        static_ff = self.replayssm_force_flush_list[bs - 1]
+        if write_pos_buf is None:
+            return static_wp, static_ff, ring_indices
+
+        slots = mamba_indices.to(torch.long)
+        safe_slots = slots.clamp(min=0)
+        static_wp[: len(mamba_indices)].copy_(write_pos_buf[safe_slots])
+
+        force_flush_dev = None
+        if (
+            not mamba_pool.replayssm_is_kda
+            and forward_mode.is_decode_or_idle()
+            and seq_lens_cpu is not None
+        ):
+            force_flush_dev = self._replayssm_track_flush_mask(seq_lens_cpu, bs).to(
+                device=self.device, dtype=torch.int32
+            )
+            static_ff.copy_(force_flush_dev)
+        else:
+            static_ff.zero_()
+
+        if not in_capture and forward_mode.is_decode_or_idle():
+            L = mamba_pool.linear_replayssm_cache_len
+            valid_mask = slots >= 0
+            valid_slots = slots[valid_mask]
+            if valid_slots.numel() > 0:
+                cur_pos = write_pos_buf[safe_slots]
+                flushed = cur_pos == (L - 1)
+                if force_flush_dev is not None:
+                    flushed = flushed | (force_flush_dev != 0)
+                next_pos = torch.where(
+                    flushed,
+                    torch.zeros_like(cur_pos),
+                    (cur_pos + 1) % L,
+                )
+                uniq_slots, inv = torch.unique(valid_slots, return_inverse=True)
+                next_for_valid = next_pos[valid_mask]
+                new_vals = torch.empty(
+                    uniq_slots.shape[0],
+                    dtype=write_pos_buf.dtype,
+                    device=write_pos_buf.device,
+                )
+                new_vals[inv] = next_for_valid.to(write_pos_buf.dtype)
+                write_pos_buf[uniq_slots] = new_vals
+
+        return static_wp, static_ff, ring_indices
 
     def _replay_metadata(
         self,
@@ -145,14 +255,34 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
         if seq_lens_cpu is None:
             num_padding = 0
         else:
-            num_padding = torch.count_nonzero(
-                seq_lens_cpu == self.get_cuda_graph_seq_len_fill_value()
+            num_padding = int(
+                torch.count_nonzero(
+                    seq_lens_cpu == self.get_cuda_graph_seq_len_fill_value()
+                )
             )
         # Make sure forward metadata is correctly handled for padding reqs
         req_pool_indices[bs - num_padding :] = 0
         mamba_indices = self.req_to_token_pool.get_mamba_indices(req_pool_indices)
-        mamba_indices[bs - num_padding :] = 0
+        # ReplaySSM pads rows with the kernel's invalid-slot sentinel; the
+        # non-replay path keeps the legacy slot-0 padding (masked by
+        # query_start_loc downstream).
+        mamba_indices[bs - num_padding :] = (
+            self.pad_slot_id if self.replayssm_write_pos_list is not None else 0
+        )
         self.state_indices_list[bs - 1][: len(mamba_indices)].copy_(mamba_indices)
+        (
+            replayssm_write_pos,
+            replayssm_force_flush,
+            replayssm_ring_indices,
+        ) = self._prepare_replayssm_replay_metadata(
+            bs,
+            req_pool_indices,
+            mamba_indices,
+            forward_mode,
+            seq_lens_cpu,
+            num_padding,
+            in_capture,
+        )
         track_buf = None
         if mamba_track_indices is not None:
             track_buf = mamba_track_indices
@@ -205,6 +335,9 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
                 retrieve_next_token=self.retrieve_next_token_list[bs - 1],
                 retrieve_next_sibling=self.retrieve_next_sibling_list[bs - 1],
                 retrieve_parent_token=self.retrieve_parent_token_list[bs - 1],
+                replayssm_write_pos=replayssm_write_pos,
+                replayssm_force_flush=replayssm_force_flush,
+                replayssm_ring_indices=replayssm_ring_indices,
             )
         else:
             return ForwardMetadata(
@@ -212,6 +345,9 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
                 mamba_cache_indices=self.state_indices_list[bs - 1],
                 mamba_cache_indices_gdn=self.state_indices_list_gdn[bs - 1],
                 mamba_track_indices=track_buf,
+                replayssm_write_pos=replayssm_write_pos,
+                replayssm_force_flush=replayssm_force_flush,
+                replayssm_ring_indices=replayssm_ring_indices,
             )
 
     def get_cuda_graph_seq_len_fill_value(self):
