@@ -165,6 +165,131 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
         )
         return out.transpose(0, 1)
 
+    def _replayssm_spec_target_verify(
+        self,
+        layer: RadixLinearAttention,
+        forward_batch: ForwardBatch,
+        mixed_qkv: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        layer_cache: "MambaPool.SpeculativeState",
+        ssm_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        num_token_padding: int,
+        retrieve_parent_token: Optional[torch.Tensor],
+    ) -> Optional[torch.Tensor]:
+        """NPU GDN ReplaySSM spec-verify via the GPU circular-replay kernel.
+
+        NPU reuses the CUDA/GPU compact ``(d, k, g)`` ring protocol: the Triton
+        ``gdn_replayssm_spec_decode`` reconstructs the whole draft window from
+        the frozen checkpoint plus the per-slot circular history, instead of
+        snapshotting a full ``intermediate_ssm`` state per draft step. The
+        per-request cursors and the commit kernels are the same GPU ones
+        (``commit_gdn_replayssm_spec`` / ``commit_gdn_replayssm_circular``).
+        Conv already ran through the Ascend fused conv1d and is rolled back on
+        commit by the native ``conv_state_rollback`` kernel.
+
+        Returns ``None`` when the compact ring is not active so the caller can
+        fall back to the native recurrent verify.
+        """
+        mamba_pool = self.state_pool
+        if (
+            layer_cache.replayssm_d is None
+            or layer_cache.replayssm_k is None
+            or layer_cache.replayssm_g is None
+            or mamba_pool is None
+            or mamba_pool.replayssm_spec_fold
+            or mamba_pool.replayssm_is_kda
+            or mamba_pool.replayssm_cache_base is None
+        ):
+            return None
+        if retrieve_parent_token is not None:
+            # The compact replay kernel uses a strictly-lower causal mask and is
+            # only valid for a linear draft chain; the hook already rejects
+            # tree verify, so guard loudly rather than silently mis-cache.
+            raise ValueError(
+                "Ascend GDN ReplaySSM spec-verify requires a linear draft chain "
+                "(no retrieve_parent_token)."
+            )
+
+        from sglang.kernels.ops.attention.linear.gdn_replayssm_spec_decode import (
+            gdn_replayssm_spec_decode,
+        )
+
+        seq_len = mixed_qkv.shape[0]
+        H, K = layer.num_k_heads, layer.head_k_dim
+        HV, V = layer.num_v_heads, layer.head_v_dim
+        q, k, v = torch.split(
+            mixed_qkv,
+            [layer.q_dim, layer.k_dim, layer.v_dim],
+            dim=-1,
+        )
+        q = q.reshape(seq_len, H, K)
+        k = k.reshape(seq_len, H, K)
+        v = v.reshape(seq_len, HV, V)
+        a = a.reshape(seq_len, HV)
+        b = b.reshape(seq_len, HV)
+
+        # Eager target verify may trim token padding; keep the varlen envelope
+        # consistent with the trimmed token count.
+        draft_token_num = forward_batch.spec_info.draft_token_num
+        n_full = seq_len // draft_token_num
+        if n_full + 1 <= query_start_loc.shape[0]:
+            cu_seqlens = query_start_loc[: n_full + 1]
+            if int(cu_seqlens[-1]) != seq_len:
+                cu_seqlens = torch.cat(
+                    [cu_seqlens[:-1], cu_seqlens.new_tensor([seq_len])]
+                )
+        else:
+            cu_seqlens = query_start_loc
+        if int(cu_seqlens[-1]) != seq_len:
+            cu_seqlens = torch.cat([cu_seqlens, cu_seqlens.new_tensor([seq_len])])
+
+        out = q.new_empty(seq_len, HV, V)
+        gdn_replayssm_spec_decode(
+            q=q,
+            k=k,
+            v=v,
+            a=a,
+            b=b,
+            A_log=layer.A_log,
+            dt_bias=layer.dt_bias,
+            checkpoint_state=layer_cache.temporal,
+            d_cache=layer_cache.replayssm_d,
+            k_cache=layer_cache.replayssm_k,
+            g_cache=layer_cache.replayssm_g,
+            rawv_cache=layer_cache.replayssm_rawv,
+            rawk_cache=layer_cache.replayssm_rawk,
+            beta_cache=layer_cache.replayssm_beta,
+            out=out,
+            query_start_loc=cu_seqlens,
+            ssm_state_indices=cache_indices,
+            replay_indices=forward_batch.req_pool_indices,
+            write_pos=mamba_pool.replayssm_spec_write_pos,
+            cache_base=mamba_pool.replayssm_cache_base,
+            is_flush=mamba_pool.replayssm_is_flush,
+            max_cache_len=layer_cache.replayssm_d.shape[-2],
+            max_spec_len=draft_token_num,
+            scale=K**-0.5,
+            use_qk_l2norm_in_kernel=True,
+            null_block_id=-1,
+            launch_mode="verify",
+        )
+        out = out.reshape(seq_len, HV, V)
+        if not self.graph_mode and out.shape[0] < num_token_padding:
+            out = torch.cat(
+                [
+                    out,
+                    out.new_zeros(
+                        num_token_padding - out.shape[0],
+                        *out.shape[1:],
+                    ),
+                ],
+                dim=0,
+            )
+        return out
+
     def forward_decode(
         self,
         layer: RadixLinearAttention,
@@ -328,6 +453,21 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
             )
             conv_states[:, -(kernel_size - 1) :, :] = conv_states_for_prefill
         if is_target_verify:
+            replayssm_out = self._replayssm_spec_target_verify(
+                layer,
+                forward_batch,
+                mixed_qkv,
+                a,
+                b,
+                mamba_cache_params,
+                ssm_states,
+                cache_indices,
+                query_start_loc,
+                num_token_padding,
+                retrieve_parent_token,
+            )
+            if replayssm_out is not None:
+                return replayssm_out
             g, beta = fused_gdn_gating_kernel_without_sigmoid(
                 layer.A_log, a, b, layer.dt_bias
             )

@@ -265,10 +265,15 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
         mamba_indices = self.req_to_token_pool.get_mamba_indices(req_pool_indices)
         # ReplaySSM pads rows with the kernel's invalid-slot sentinel; the
         # non-replay path keeps the legacy slot-0 padding (masked by
-        # query_start_loc downstream).
-        mamba_indices[bs - num_padding :] = (
-            self.pad_slot_id if self.replayssm_write_pos_list is not None else 0
+        # query_start_loc downstream). The spec-verify compact ring also relies
+        # on the sentinel so the replay kernel skips padded graph rows.
+        mamba_pool = self.state_pool
+        replayssm_pad = self.replayssm_write_pos_list is not None or (
+            mamba_pool is not None
+            and getattr(mamba_pool, "replayssm_cache_base", None) is not None
+            and not mamba_pool.replayssm_is_kda
         )
+        mamba_indices[bs - num_padding :] = self.pad_slot_id if replayssm_pad else 0
         self.state_indices_list[bs - 1][: len(mamba_indices)].copy_(mamba_indices)
         (
             replayssm_write_pos,
@@ -384,7 +389,6 @@ class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
         - index_select kernel launches
         - nonzero kernel launches
         """
-        del req_pool_indices  # accepted for hook parity; slots come from metadata
         request_number = last_correct_step_indices.shape[0]
 
         state_indices_tensor = (
@@ -393,7 +397,43 @@ class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
             ]
         )
 
-        mamba_caches = self.linear_attn_backend.state_pool.get_speculative_mamba2_params_all_layers()
+        state_pool = self.linear_attn_backend.state_pool
+        # ReplaySSM spec-verify (GDN compact ring): no intermediate_ssm is
+        # allocated; the accepted window lives in the per-request (d, k, g)
+        # ring. dspark/dflash call this method directly, while the generic
+        # spec_utils commit delegates here too; both advance the same GPU Triton
+        # ring cursors and roll back conv with the native Ascend kernel.
+        if (
+            state_pool is not None
+            and state_pool.replayssm_cache_base is not None
+            and not state_pool.replayssm_is_kda
+        ):
+            from sglang.srt.runtime_context import get_spec
+            from sglang.srt.speculative.spec_utils import (
+                _commit_gdn_replayssm_compact_after_verify,
+            )
+
+            if req_pool_indices is None:
+                raise ValueError(
+                    "Ascend ReplaySSM spec-verify commit requires "
+                    "req_pool_indices (the compact ring cursors are keyed by "
+                    "request slot)."
+                )
+            replay_indices = req_pool_indices[:request_number]
+            _commit_gdn_replayssm_compact_after_verify(
+                mamba_pool=state_pool,
+                spec_state=state_pool.get_speculative_mamba2_params_all_layers(),
+                state_batch_indices=state_indices_tensor,
+                replay_indices=replay_indices,
+                accept_lens=last_correct_step_indices + 1,
+                last_correct_step_indices=last_correct_step_indices,
+                mamba_track_indices=mamba_track_indices,
+                mamba_steps_to_track=mamba_steps_to_track,
+                draft_token_num=get_spec().speculative_num_draft_tokens,
+            )
+            return
+
+        mamba_caches = state_pool.get_speculative_mamba2_params_all_layers()
 
         conv_states = mamba_caches.conv[0]
         ssm_states = mamba_caches.temporal

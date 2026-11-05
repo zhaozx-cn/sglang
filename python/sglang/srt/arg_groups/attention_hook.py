@@ -465,6 +465,13 @@ def handle_linear_attn_backend(server_args: Any):
                 "EAGLE tree verify. Got "
                 f"--speculative-eagle-topk={cfg.speculative_eagle_topk!r}."
             )
+        if get_platform().is_npu and uses_kda_attention(
+            model_config_of(server_args).hf_config
+        ):
+            raise ValueError(
+                "--enable-linear-replayssm-spec on NPU is only supported for "
+                "GDN (compact circular replay); KDA is not wired on Ascend yet."
+            )
         if decode not in ("triton", "flashinfer"):
             raise ValueError(
                 "--enable-linear-replayssm-spec requires the triton or "

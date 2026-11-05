@@ -1163,6 +1163,119 @@ def _verify_commit_step_indices(
     return last_correct_step_indices, mamba_steps_to_track
 
 
+def _commit_gdn_replayssm_compact_after_verify(
+    *,
+    mamba_pool,
+    spec_state,
+    state_batch_indices: torch.Tensor,
+    replay_indices: torch.Tensor,
+    accept_lens: torch.Tensor,
+    last_correct_step_indices: torch.Tensor,
+    mamba_track_indices: Optional[torch.Tensor],
+    mamba_steps_to_track: Optional[torch.Tensor],
+    draft_token_num: int,
+    src_indices_raw: Optional[torch.Tensor] = None,
+) -> None:
+    """Advance the ReplaySSM compact ring and roll back conv state.
+
+    The accepted drafts were written into the per-request ``(d, k, g)`` circular
+    history during verify; the GPU Triton commit kernels advance the cursors by
+    the accepted count and fold the capacity/track rows into the fp32
+    checkpoint. Conv rollback stays platform-specific: CUDA scatters the
+    per-draft window from ``intermediate_conv_window``, while NPU verify writes
+    the draft window directly into the persistent conv slot and rolls it back
+    with the native kernel.
+    """
+    from sglang.kernels.ops.attention.linear.gdn_replayssm_spec_decode import (
+        commit_gdn_replayssm_circular,
+        commit_gdn_replayssm_spec,
+    )
+
+    commit_gdn_replayssm_spec(
+        write_pos=mamba_pool.replayssm_spec_write_pos,
+        cache_base=mamba_pool.replayssm_cache_base,
+        is_flush=mamba_pool.replayssm_is_flush,
+        num_accepted=accept_lens,
+        replay_indices=replay_indices,
+        max_cache_len=spec_state.replayssm_d.shape[-2],
+        max_spec_len=draft_token_num,
+        fold_every_commit=spec_state.temporal.dtype != torch.float32,
+        null_block_id=-1,
+    )
+    commit_gdn_replayssm_circular(
+        checkpoint_state=spec_state.temporal,
+        d_cache=spec_state.replayssm_d,
+        k_cache=spec_state.replayssm_k,
+        g_cache=spec_state.replayssm_g,
+        d_residual_cache=spec_state.replayssm_rawv,
+        k_residual_cache=spec_state.replayssm_rawk,
+        state_batch_indices=state_batch_indices,
+        replay_indices=replay_indices,
+        write_pos=mamba_pool.replayssm_spec_write_pos,
+        cache_base=mamba_pool.replayssm_cache_base,
+        is_flush=mamba_pool.replayssm_is_flush,
+        accept_lens=accept_lens,
+        mamba_track_indices=mamba_track_indices,
+        mamba_steps_to_track=mamba_steps_to_track,
+        null_block_id=-1,
+    )
+
+    if _is_npu:
+        from sgl_kernel_npu.mamba.mamba_state_update_triton import (
+            conv_state_rollback,
+        )
+
+        has_track = (
+            mamba_track_indices is not None
+            and mamba_steps_to_track is not None
+            and mamba_track_indices.numel() > 0
+        )
+        for conv_states in spec_state.conv:
+            # Snapshot the interval-crossing track rows before rolling back the
+            # working slot (NPU keeps no per-step conv intermediates).
+            if has_track:
+                track_mask = mamba_steps_to_track >= 0
+                src_slots = torch.where(
+                    track_mask, state_batch_indices, mamba_track_indices
+                )
+                conv_states[:, mamba_track_indices] = conv_states[:, src_slots]
+            if state_batch_indices.numel() > 0:
+                conv_state_rollback(
+                    conv_states,
+                    state_batch_indices,
+                    last_correct_step_indices,
+                    draft_token_num,
+                )
+            if has_track:
+                conv_state_rollback(
+                    conv_states,
+                    mamba_track_indices,
+                    mamba_steps_to_track,
+                    draft_token_num,
+                )
+        return
+
+    from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
+        fused_conv_window_scatter_with_mask,
+    )
+
+    fused_conv_window_scatter_with_mask(
+        spec_state.conv[0],
+        spec_state.intermediate_conv_window[0],
+        state_batch_indices,
+        last_correct_step_indices,
+        src_indices_raw,
+    )
+    if mamba_track_indices is not None:
+        fused_conv_window_scatter_with_mask(
+            spec_state.conv[0],
+            spec_state.intermediate_conv_window[0],
+            mamba_track_indices,
+            mamba_steps_to_track,
+            src_indices_raw,
+        )
+
+
 def commit_mamba_states_after_verify(
     target_worker: TpModelWorker,
     batch: ScheduleBatch,
@@ -1247,17 +1360,8 @@ def commit_mamba_states_after_verify(
     ):
         if batch.forward_mode.is_idle() or accept_index.numel() == 0:
             return
-        from sglang.kernels.ops.attention.linear.gdn_replayssm_spec_decode import (
-            commit_gdn_replayssm_circular,
-            commit_gdn_replayssm_spec,
-        )
-        from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
-            fused_conv_window_scatter_with_mask,
-        )
-
         spec_state = mamba_pool.get_speculative_mamba2_params_all_layers()
         state_batch_indices = req_pool.get_mamba_indices(batch.req_pool_indices)
-        replay_indices = batch.req_pool_indices
         if prepared_step_indices is None:
             last_correct_step_indices, mamba_steps_to_track = (
                 _verify_commit_step_indices(
@@ -1269,54 +1373,33 @@ def commit_mamba_states_after_verify(
             )
         else:
             last_correct_step_indices, mamba_steps_to_track = prepared_step_indices
-        # Advance the per-request circular cursors by the accepted count (incl. the
-        # bonus token). max_cache_len = ring length L = replayssm_d.shape[-2].
-        commit_gdn_replayssm_spec(
-            write_pos=mamba_pool.replayssm_spec_write_pos,
-            cache_base=mamba_pool.replayssm_cache_base,
-            is_flush=mamba_pool.replayssm_is_flush,
-            num_accepted=accept_lens,  # [bs], includes the bonus token
-            replay_indices=replay_indices,
-            max_cache_len=spec_state.replayssm_d.shape[-2],
-            max_spec_len=draft_token_num,
-            fold_every_commit=spec_state.temporal.dtype != torch.float32,
-            null_block_id=-1,  # SGLang: valid slots >= 0, padding == -1
-        )
-        # Capacity rows fold all layers in one launch; track rows snapshot the
-        # exact crossing state without disturbing the active circular history.
-        commit_gdn_replayssm_circular(
-            checkpoint_state=spec_state.temporal,
-            d_cache=spec_state.replayssm_d,
-            k_cache=spec_state.replayssm_k,
-            g_cache=spec_state.replayssm_g,
-            d_residual_cache=spec_state.replayssm_rawv,
-            k_residual_cache=spec_state.replayssm_rawk,
+
+        # NPU verify writes the draft conv window directly into the persistent
+        # slot, so keep the conv rollback in the backend override (which also
+        # translates virtual mamba ids). The override advances the same GPU
+        # compact ring cursors via _commit_gdn_replayssm_compact_after_verify.
+        if _is_npu:
+            model_runner.attn_backend.update_mamba_state_after_mtp_verify(
+                last_correct_step_indices=last_correct_step_indices,
+                mamba_track_indices=batch.mamba_track_indices,
+                mamba_steps_to_track=mamba_steps_to_track,
+                model=model_runner.model,
+                req_pool_indices=batch.req_pool_indices[:bs],
+            )
+            return
+
+        _commit_gdn_replayssm_compact_after_verify(
+            mamba_pool=mamba_pool,
+            spec_state=spec_state,
             state_batch_indices=state_batch_indices,
-            replay_indices=replay_indices,
-            write_pos=mamba_pool.replayssm_spec_write_pos,
-            cache_base=mamba_pool.replayssm_cache_base,
-            is_flush=mamba_pool.replayssm_is_flush,
+            replay_indices=batch.req_pool_indices,
             accept_lens=accept_lens,
+            last_correct_step_indices=last_correct_step_indices,
             mamba_track_indices=batch.mamba_track_indices,
             mamba_steps_to_track=mamba_steps_to_track,
-            null_block_id=-1,
+            draft_token_num=draft_token_num,
+            src_indices_raw=src_indices_raw,
         )
-        # Roll back active conv state and snapshot its interval-crossing window.
-        fused_conv_window_scatter_with_mask(
-            spec_state.conv[0],
-            spec_state.intermediate_conv_window[0],
-            state_batch_indices,
-            last_correct_step_indices,
-            src_indices_raw,
-        )
-        if batch.mamba_track_indices is not None:
-            fused_conv_window_scatter_with_mask(
-                spec_state.conv[0],
-                spec_state.intermediate_conv_window[0],
-                batch.mamba_track_indices,
-                mamba_steps_to_track,
-                src_indices_raw,
-            )
         return
 
     # KDA ReplaySSM (fold-every-commit): KDA keeps its own recurrent verify kernel

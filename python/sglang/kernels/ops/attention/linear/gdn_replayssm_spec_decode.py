@@ -34,7 +34,9 @@ Differences from the vLLM reference:
 Linear-chain only: the intra-window interaction uses a strictly-lower causal
 mask, so this kernel is valid only for linear draft chains
 (``speculative_eagle_topk <= 1``, i.e. MTP / frozen-KV-MTP). Tree verify
-(topk > 1), KDA, and NPU/CPU fall back to the recurrent verify kernel.
+(topk > 1) and KDA fall back to the recurrent verify kernel. NPU GDN routes
+here too (the Ascend backend commits with the same GPU cursor/fold kernels and
+the native conv rollback); this file's kernels themselves remain GPU-Triton.
 """
 
 from __future__ import annotations
