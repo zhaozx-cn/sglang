@@ -231,20 +231,15 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
         a = a.reshape(seq_len, HV)
         b = b.reshape(seq_len, HV)
 
-        # Eager target verify may trim token padding; keep the varlen envelope
-        # consistent with the trimmed token count.
+        # Query start locations line up with whole draft windows. Eager target
+        # verify may trim trailing *whole* padding rows, so hand the kernel only
+        # the windows that own real tokens. Derive the count from tensor shapes
+        # / host-side token counts only: reading `query_start_loc[-1]` (e.g.
+        # `int(t)` / `.item()`) would force a device->host sync and is illegal
+        # during graph capture.
         draft_token_num = forward_batch.spec_info.draft_token_num
         n_full = seq_len // draft_token_num
-        if n_full + 1 <= query_start_loc.shape[0]:
-            cu_seqlens = query_start_loc[: n_full + 1]
-            if int(cu_seqlens[-1]) != seq_len:
-                cu_seqlens = torch.cat(
-                    [cu_seqlens[:-1], cu_seqlens.new_tensor([seq_len])]
-                )
-        else:
-            cu_seqlens = query_start_loc
-        if int(cu_seqlens[-1]) != seq_len:
-            cu_seqlens = torch.cat([cu_seqlens, cu_seqlens.new_tensor([seq_len])])
+        cu_seqlens = query_start_loc[: n_full + 1]
 
         out = q.new_empty(seq_len, HV, V)
         gdn_replayssm_spec_decode(
