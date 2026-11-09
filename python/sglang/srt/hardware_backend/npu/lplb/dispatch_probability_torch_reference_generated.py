@@ -31,12 +31,22 @@ Architecture (see ``sketch.txt``):
   limit and failed to compile at PADT >= 16384).
 * **Adaptive tile width.**  ``tl.gather`` is priced per instruction, not per
   lane, so BLOCK only affects the UB temporaries of the unrolled gather chain.
-  The host therefore walks ``_BLOCK_LADDER`` (1024 -> 128) and keeps the UB
-  path alive by narrowing the tile when the tables are large
-  (``_ub_need(pad_tab, MC, BLOCK, tables) <= _UB_BUDGET_BYTES``).  Only tables
-  whose single copy cannot fit at BLOCK=128 (>= 64K entries) take the all-GM
-  path; two copies stop fitting at >= 32K entries, which is where the
-  prob-only path takes over.
+  The host therefore walks ``_BLOCK_LADDER`` (1024 -> 64) and keeps the UB path
+  alive by narrowing the tile when the tables are large
+  (``_ub_need(pad_tab, MC, BLOCK, tables) <= _UB_BUDGET_BYTES``).  Narrowing to
+  64 matters once a row has many copies: it is what still lets *both* tables
+  stay resident at MC=68 with a 16K-entry table (measured 0.65 ms vs 1.79 ms
+  when the map falls back to GM reads).  Only tables whose single copy cannot
+  fit at BLOCK=64 (>= 128K entries) take the all-GM path; two copies stop
+  fitting at >= 32K entries, which is where the prob-only path takes over.
+* **Bounded row unrolling.**  A row with ``MC`` copies costs ``2*MC+1`` unlifted
+  ``tl.gather`` ops when the ``c`` loop is unrolled, and bishengir's
+  auto-blockify pass is super-linear in that count: MC=68 never finished
+  compiling (>420 s at BLOCK=128) and MC=20 took 97 s.  Rows wider than
+  ``_UNROLL_MAX`` are therefore walked by a runtime ``tl.range`` with
+  ``loop_unroll_factor=_CHUNK_UNROLL``, which keeps the body at a constant op
+  count (MC=68: 20 s / 0.65 ms).  Rows at or below ``_UNROLL_MAX`` keep the
+  fully unrolled form, so their codegen is unchanged.
 * **Sequential cumulative sum.**  The output is an integral expert id compared
   with strict equality, so the prefix sum is accumulated in ``c = 0..MC-1``
   order with ``tl.static_range`` -- exactly the reference's ``cumsum`` / CUDA
@@ -60,10 +70,19 @@ _UB_BUDGET_BYTES = 176 * 1024
 # Candidate tile widths, largest first.  A larger BLOCK costs UB temporaries
 # (~4*BLOCK bytes per live vector in the unrolled gather chain) but nothing else,
 # because `tl.gather` is priced per instruction, not per lane.
-_BLOCK_LADDER = (1024, 512, 256, 128)
+_BLOCK_LADDER = (1024, 512, 256, 128, 64)
 # BLOCK used when no table fits in UB (direct GM path): the per-lane indirect
 # load is scalarised, so a narrow tile amortises it best.
 _GM_BLOCK = 256
+
+# Row widths up to this are fully unrolled over the MC copies.  Beyond it the
+# row is walked by a *runtime* loop with a bounded unroll factor: unrolling all
+# MC copies makes bishengir's auto-blockify pass super-linear (measured on
+# n=12000: MC=68 never finishes, >420 s at BLOCK=128, and MC=20 takes 97 s),
+# while the bounded form keeps the same op count per loop body by a wide margin
+# (MC=68: 15.6 s / 2.44 ms vs torch 41.7 ms).
+_UNROLL_MAX: tl.constexpr = 8
+_CHUNK_UNROLL: tl.constexpr = 4
 
 
 def _ub_need(pad_tab, mc, block, tables):
@@ -102,6 +121,21 @@ def _next_pow2(n, floor=16):
 
 
 @triton.jit
+def _row_at(p_src, m_src, prob_ptr, map_ptr, idx, msk,
+            PROB_UB: tl.constexpr, MAP_UB: tl.constexpr):
+    """One ``(prob, valid)`` pair of a row, from UB tables or from GM."""
+    if PROB_UB:
+        pv = tl.gather(p_src, idx, 0)
+    else:
+        pv = tl.load(prob_ptr + idx, mask=msk, other=0.0)
+    if MAP_UB:
+        mv = tl.gather(m_src, idx, 0)
+    else:
+        mv = tl.load(map_ptr + idx, mask=msk, other=-1).to(tl.float32)
+    return pv, mv
+
+
+@triton.jit
 def dispatch_probability_kernel(
     topk_ptr,
     prob_ptr,
@@ -127,8 +161,12 @@ def dispatch_probability_kernel(
         tm = ot < TAB
     if PROB_UB:
         p_tab = tl.load(prob_ptr + ot, mask=tm, other=0.0)
+    else:
+        p_tab = prob_ptr  # placeholder: only read when PROB_UB
     if MAP_UB:
         m_tab = tl.load(map_ptr + ot, mask=tm, other=-1).to(tl.float32)
+    else:
+        m_tab = map_ptr  # placeholder: only read when MAP_UB
 
     o = tl.arange(0, BLOCK)
     for i in tl.static_range(0, (NB + NC - 1) // NC):
@@ -146,18 +184,25 @@ def dispatch_probability_kernel(
         # --- stage 1: row sum over the probability row -----------------------
         row_sum = tl.zeros([BLOCK], tl.float32)
         nvalid = tl.zeros([BLOCK], tl.float32)
-        for c in tl.static_range(0, MC):
-            idx = base + c
-            if PROB_UB:
-                pv = tl.gather(p_tab, idx, 0)
-            else:
-                pv = tl.load(prob_ptr + idx, mask=msk, other=0.0)
-            if MAP_UB:
-                mv = tl.gather(m_tab, idx, 0)
-            else:
-                mv = tl.load(map_ptr + idx, mask=msk, other=-1).to(tl.float32)
-            row_sum += pv
-            nvalid += tl.where(mv >= 0.0, 1.0, 0.0)
+        if MC <= _UNROLL_MAX:
+            for c in tl.static_range(0, MC):
+                idx = base + c
+                if PROB_UB:
+                    pv = tl.gather(p_tab, idx, 0)
+                else:
+                    pv = tl.load(prob_ptr + idx, mask=msk, other=0.0)
+                if MAP_UB:
+                    mv = tl.gather(m_tab, idx, 0)
+                else:
+                    mv = tl.load(map_ptr + idx, mask=msk, other=-1).to(tl.float32)
+                row_sum += pv
+                nvalid += tl.where(mv >= 0.0, 1.0, 0.0)
+        else:
+            for c in tl.range(0, MC, loop_unroll_factor=_CHUNK_UNROLL):
+                pv, mv = _row_at(p_tab, m_tab, prob_ptr, map_ptr, base + c, msk,
+                                 PROB_UB, MAP_UB)
+                row_sum += pv
+                nvalid += tl.where(mv >= 0.0, 1.0, 0.0)
 
         u = r0 * row_sum
         uf = r0 * nvalid
@@ -167,24 +212,35 @@ def dispatch_probability_kernel(
         cum = tl.zeros([BLOCK], tl.float32)
         cumf = tl.zeros([BLOCK], tl.float32)
         chosen = tl.zeros([BLOCK], tl.int32)
-        for c in tl.static_range(0, MC):
-            idx = base + c
-            if PROB_UB:
-                pv = tl.gather(p_tab, idx, 0)
-            else:
-                pv = tl.load(prob_ptr + idx, mask=msk, other=0.0)
-            if MAP_UB:
-                mv = tl.gather(m_tab, idx, 0)
-            else:
-                mv = tl.load(map_ptr + idx, mask=msk, other=-1).to(tl.float32)
-            cum += pv
-            cumf += tl.where(mv >= 0.0, 1.0, 0.0)
-            # count of cum[c] <= u over the row; zero rows use the valid-replica
-            # prefix count, matching the reference's fallback_probs + row_sum.
-            hit = tl.where(
-                has_p, (cum <= u).to(tl.int32), (cumf <= uf).to(tl.int32)
-            )
-            chosen += hit
+        if MC <= _UNROLL_MAX:
+            for c in tl.static_range(0, MC):
+                idx = base + c
+                if PROB_UB:
+                    pv = tl.gather(p_tab, idx, 0)
+                else:
+                    pv = tl.load(prob_ptr + idx, mask=msk, other=0.0)
+                if MAP_UB:
+                    mv = tl.gather(m_tab, idx, 0)
+                else:
+                    mv = tl.load(map_ptr + idx, mask=msk, other=-1).to(tl.float32)
+                cum += pv
+                cumf += tl.where(mv >= 0.0, 1.0, 0.0)
+                # count of cum[c] <= u over the row; zero rows use the valid-replica
+                # prefix count, matching the reference's fallback_probs + row_sum.
+                hit = tl.where(
+                    has_p, (cum <= u).to(tl.int32), (cumf <= uf).to(tl.int32)
+                )
+                chosen += hit
+        else:
+            for c in tl.range(0, MC, loop_unroll_factor=_CHUNK_UNROLL):
+                pv, mv = _row_at(p_tab, m_tab, prob_ptr, map_ptr, base + c, msk,
+                                 PROB_UB, MAP_UB)
+                cum += pv
+                cumf += tl.where(mv >= 0.0, 1.0, 0.0)
+                hit = tl.where(
+                    has_p, (cum <= u).to(tl.int32), (cumf <= uf).to(tl.int32)
+                )
+                chosen += hit
         chosen = tl.where(chosen > MC - 1, MC - 1, chosen)  # clamp(max=MC-1)
 
         # --- stage 3: one lookup picks the physical id -----------------------
