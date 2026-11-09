@@ -179,23 +179,24 @@ class LPLBSolver:
         # without per-call .long() casts (Tier 1 optimization).
         self.log2phy = log2phy.to(torch.int64).contiguous()
 
-        # Pre-JIT-compile the fused IPM kernel for this (NC, NV) shape so the
+        # Pre-JIT-compile the IPM kernel for this (NC, NV) shape so the
         # 20-40s compile cost happens once at startup rather than on the first
         # real request. No-op when the fused backend is unavailable.
         nc = self.A_base.shape[0]
         nv = self.A_base.shape[1] + 1  # +1 for Big-M column added in solve()
-        from sglang.kernels.ops.lplb.torch_solver import warmup as _ipm_warmup
+        from sglang.srt.eplb.lplb_backend import get_lplb_warmup
 
+        _ipm_warmup = get_lplb_warmup()
         _ipm_warmup(nc, nv, num_iters=5, device=device)
 
         # Pre-compute A_base row sum (used in every prep call).
         self._A_base_row_sum = self.A_base.sum(dim=1).contiguous()  # (NC,)
 
-        # Pre-allocate the buffers the JIT CUDA prep / IPM / post kernels write
+        # Pre-allocate the buffers the fused prep / IPM / post kernels write
         # into. All writes are contiguous full-tensor stores (no strided
         # ``out=`` semantics), so the reuse is safe under high concurrency.
-        # Constructed lazily on the first solve() call (we don't know the
-        # device-side log2phy_prob shape until then) — see _solve.
+        # ``_x`` is reused by the CUDA backend; the NPU IPM kernel allocates its
+        # own output, so ``_solve`` always uses the returned tensor.
         self._A_full = torch.empty(nc, nv, dtype=torch.float32, device=device)
         self._A_full[:, : nv - 1].copy_(self.A_base)
         self._b = torch.empty(nc, dtype=torch.float32, device=device)
@@ -254,15 +255,18 @@ class LPLBSolver:
         return self._solve(global_counts)
 
     def _solve(self, global_counts: torch.Tensor) -> torch.Tensor:
-        """Three CUDA kernel launches replace ~14 torch ops.
+        """Three fused kernel launches replace ~14 torch ops.
 
-        Pipeline (all writes go into pre-allocated buffers from __init__):
-            prep_lp_inputs → solve_ipm → extract_log2phy_prob
-        Raises if the JIT CUDA backend is unavailable.
+        Pipeline: prep_lp_inputs → solve_ipm → extract_log2phy_prob.
+        The kernels are selected per platform (CUDA JIT or Ascend NPU Triton).
+        The prep/post kernels write into pre-allocated buffers; the NPU IPM
+        kernel allocates and returns its own output.
+        Raises if no backend is available.
         """
-        from sglang.kernels.ops.lplb import cuda_solver
+        from sglang.srt.eplb.lplb_backend import get_lplb_backend
 
-        cuda_solver.prep_lp_inputs(
+        backend = get_lplb_backend()
+        backend.prep_lp_inputs(
             self._A_full,
             self._b,
             self._t1,
@@ -272,10 +276,13 @@ class LPLBSolver:
             self.B1,
             self._A_base_row_sum,
         )
-        cuda_solver.solve_ipm(self._A_full, self._b, self.c_vec, result=self._x)
-        cuda_solver.extract_log2phy_prob(
+        # The NPU kernel allocates its own output and ignores ``result``, so use
+        # the returned tensor instead of assuming the pre-allocated buffer was
+        # written (CUDA still reuses ``self._x``).
+        x = backend.solve_ipm(self._A_full, self._b, self.c_vec, result=self._x)
+        backend.extract_log2phy_prob(
             self._log2phy_prob,
-            self._x,
+            x,
             self._t1,
             self.phy_single,
             self.phy_replicated,
