@@ -29,16 +29,23 @@ Architecture (see ``sketch.txt``):
   The validity indicator is derived from the map value in every path, so no
   third table is ever live (the earlier three-table form sat right at the UB
   limit and failed to compile at PADT >= 16384).
-* **Adaptive tile width.**  ``tl.gather`` is priced per instruction, not per
-  lane, so BLOCK only affects the UB temporaries of the unrolled gather chain.
-  The host therefore walks ``_BLOCK_LADDER`` (1024 -> 64) and keeps the UB path
-  alive by narrowing the tile when the tables are large
-  (``_ub_need(pad_tab, MC, BLOCK, tables) <= _UB_BUDGET_BYTES``).  Narrowing to
-  64 matters once a row has many copies: it is what still lets *both* tables
-  stay resident at MC=68 with a 16K-entry table (measured 0.65 ms vs 1.79 ms
-  when the map falls back to GM reads).  Only tables whose single copy cannot
-  fit at BLOCK=64 (>= 128K entries) take the all-GM path; two copies stop
-  fitting at >= 32K entries, which is where the prob-only path takes over.
+* **Batch-size-independent tile width.**  ``tl.gather`` is priced per
+  instruction, not per lane, so BLOCK only affects the UB temporaries of the
+  unrolled gather chain.  The host therefore walks ``_BLOCK_LADDER``
+  (1024 -> 64) and keeps the UB path alive by narrowing the tile when the
+  tables are large (``_ub_need(pad_tab, MC, BLOCK, tables) <=
+  _UB_BUDGET_BYTES``).  Narrowing to 64 matters once a row has many copies: it
+  is what still lets *both* tables stay resident at MC=68 with a 16K-entry
+  table (measured 0.65 ms vs 1.79 ms when the map falls back to GM reads).
+  Only tables whose single copy cannot fit at BLOCK=64 (>= 128K entries) take
+  the all-GM path; two copies stop fitting at >= 32K entries, which is where
+  the prob-only path takes over.
+  The ladder is walked **independently of the batch size**: ``BLOCK``,
+  ``PROB_UB`` and ``MAP_UB`` are ``tl.constexpr`` and therefore part of the
+  compilation cache key, so deriving them from ``N`` would recompile the kernel
+  for every distinct token count (15 s - 420 s per compile here).  ``N``, the
+  block count and the grid size are plain runtime scalars instead, so one
+  binary serves decode, prefill chunks and every graph size.
 * **Bounded row unrolling.**  A row with ``MC`` copies costs ``2*MC+1`` unlifted
   ``tl.gather`` ops when the ``c`` loop is unrolled, and bishengir's
   auto-blockify pass is super-linear in that count: MC=68 never finished
@@ -70,6 +77,8 @@ _UB_BUDGET_BYTES = 176 * 1024
 # Candidate tile widths, largest first.  A larger BLOCK costs UB temporaries
 # (~4*BLOCK bytes per live vector in the unrolled gather chain) but nothing else,
 # because `tl.gather` is priced per instruction, not per lane.
+# BLOCK is a constexpr, so the chosen width must not depend on the batch size --
+# otherwise every distinct token count pays a fresh Triton-Ascend compile.
 _BLOCK_LADDER = (1024, 512, 256, 128, 64)
 # BLOCK used when no table fits in UB (direct GM path): the per-lane indirect
 # load is scalarised, so a narrow tile amortises it best.
@@ -90,10 +99,14 @@ def _ub_need(pad_tab, mc, block, tables):
     return 4 * tables * pad_tab + 4 * block * (2 * mc + 10)
 
 
-def _pick_block(pad_tab, mc, n, tables):
-    """Largest ladder width whose UB footprint fits, or None if nothing fits."""
-    top = min(1024, _next_pow2(max(16, n)))
-    for cand in (top,) + tuple(b for b in _BLOCK_LADDER if b < top):
+def _pick_block(pad_tab, mc, tables):
+    """Largest ladder width whose UB footprint fits, or None if nothing fits.
+
+    Only table geometry feeds the decision.  The batch size is deliberately not
+    an input: ``BLOCK`` is a ``tl.constexpr``, so a batch-dependent tile width
+    would recompile the kernel for every distinct token count.
+    """
+    for cand in _BLOCK_LADDER:
         if _ub_need(pad_tab, mc, cand, tables) <= _UB_BUDGET_BYTES:
             return cand
     return None
@@ -135,24 +148,31 @@ def _row_at(p_src, m_src, prob_ptr, map_ptr, idx, msk,
     return pv, mv
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["N", "NC"])
 def dispatch_probability_kernel(
     topk_ptr,
     prob_ptr,
     map_ptr,
     rnd_ptr,
     out_ptr,
-    N: tl.constexpr,
+    N,
+    NC,
     MC: tl.constexpr,
     TAB: tl.constexpr,
     PADT: tl.constexpr,
     BLOCK: tl.constexpr,
-    NB: tl.constexpr,
-    NC: tl.constexpr,
     PROB_UB: tl.constexpr,
     MAP_UB: tl.constexpr,
 ):
-    """``out[i] = log2phy_map[topk_ids[i], inverse_cdf(log2phy_prob[topk_ids[i]])]``."""
+    """``out[i] = log2phy_map[topk_ids[i], inverse_cdf(log2phy_prob[topk_ids[i]])]``.
+
+    ``N`` (flattened ``topk_ids`` length) and ``NC`` (grid size) are runtime
+    scalars, not ``tl.constexpr``: they change with the batch size on every
+    forward pass, and specialising on them would trigger a Triton-Ascend
+    recompilation per distinct token count.  Everything that shapes a tile
+    (``PADT``/``TAB``/``MC``/``BLOCK``) or selects a code path (``PROB_UB``/
+    ``MAP_UB``) stays constexpr because the expert layout fixes it.
+    """
     pid = tl.program_id(0).to(tl.int32)
 
     # --- stage 0: whole tables into UB, once per program ---------------------
@@ -169,7 +189,11 @@ def dispatch_probability_kernel(
         m_tab = map_ptr  # placeholder: only read when MAP_UB
 
     o = tl.arange(0, BLOCK)
-    for i in tl.static_range(0, (NB + NC - 1) // NC):
+    # Runtime block loop: the trip count depends on N, a launch-time value.
+    # Blocks are strided by the grid size (NC), so each program still walks its
+    # own subset and the tail is masked by `offs < N`.
+    n_blocks = tl.cdiv(N, BLOCK)
+    for i in tl.range(0, tl.cdiv(n_blocks, NC)):
         blk = pid + i * NC
         offs = blk * BLOCK + o
         msk = offs < N
@@ -272,6 +296,12 @@ class ModelNew(nn.Module):
         n = flat_ids.numel()
         num_logical, max_copies = log2phy_prob.shape
 
+        # Idle ranks can reach here with an empty tensor; a zero grid is invalid.
+        if n == 0:
+            return torch.empty(
+                original_shape, dtype=topk_ids.dtype, device=topk_ids.device
+            )
+
         if self._vec_cores is None:
             self._vec_cores = _num_vectorcore(topk_ids.device.index or 0)
         nvec = self._vec_cores
@@ -283,19 +313,22 @@ class ModelNew(nn.Module):
 
         # Preloading is worth 1-2 orders of magnitude over per-lane GM reads, so
         # keep as many tables resident as the UB budget allows.  Beyond it the
-        # compiler would abort with "ub overflow" (see the runbook).
+        # compiler would abort with "ub overflow" (see the runbook).  The choice
+        # depends only on the table geometry, never on `n`, so a serving run
+        # compiles this kernel exactly once.
         tab = num_logical * max_copies
         pad_tab = _next_pow2(tab)
         prob_ub = map_ub = False
-        picked = _pick_block(pad_tab, max_copies, n, 2)
+        picked = _pick_block(pad_tab, max_copies, 2)
         if picked is not None:
             block, prob_ub, map_ub = picked, True, True
         else:
-            picked = _pick_block(pad_tab, max_copies, n, 1)
+            picked = _pick_block(pad_tab, max_copies, 1)
             if picked is not None:
                 block, prob_ub = picked, True
             else:
-                block = min(_GM_BLOCK, _next_pow2(max(16, n)))
+                block = _GM_BLOCK
+        # Runtime launch geometry: never constexpr (see the kernel docstring).
         nb = (n + block - 1) // block
         nc = min(nvec, nb)
 
@@ -305,13 +338,12 @@ class ModelNew(nn.Module):
             mp,
             rv,
             out,
-            N=n,
+            n,
+            nc,
             MC=max_copies,
             TAB=tab,
             PADT=pad_tab,
             BLOCK=block,
-            NB=nb,
-            NC=nc,
             PROB_UB=prob_ub,
             MAP_UB=map_ub,
         )
