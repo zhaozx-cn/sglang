@@ -15,6 +15,17 @@ Architecture (see ``sketch.txt``):
   owns one ``(token, slot)`` and performs the whole inverse-CDF sample in
   registers, so the ~8 torch ops of the reference collapse into one launch
   (index_computation G1: parallel axis follows the contiguous output/index).
+* **Table extent is a 32-byte multiple, not a power of two.**  ``PADT`` is only
+  the extent of the UB table tile; the tail ``[TAB, PADT)`` is masked on load and
+  unreachable by any gather index, so no extra element is ever fetched.  Triton's
+  "``tl.arange`` range must be a power of two" rule is enforced by this backend
+  only under ``compile_mode="simt_only"``, hence rounding to the 32-byte granule
+  (``8`` fp32 lanes) is legal in the default mode.  Rounding to a power of two
+  instead inflates the resident table by up to 1.8x and charges it to the same
+  budget that picks ``BLOCK`` and decides whether the map table may stay
+  resident: measured at MC=68 with an 8704-entry table this way is what forces
+  ``BLOCK`` from 128 down to 64 (2.08x slower) and, at 17408 entries, what drops
+  the map to GM reads (4.90x slower).
 * **Three table access paths, selected on the host by UB budget.**
   - ``PROB_UB=1, MAP_UB=1`` (both tables fit): the probability table and the
     logical->physical table are preloaded into UB once per program and the
@@ -34,12 +45,10 @@ Architecture (see ``sketch.txt``):
   unrolled gather chain.  The host therefore walks ``_BLOCK_LADDER``
   (1024 -> 64) and keeps the UB path alive by narrowing the tile when the
   tables are large (``_ub_need(pad_tab, MC, BLOCK, tables) <=
-  _UB_BUDGET_BYTES``).  Narrowing to 64 matters once a row has many copies: it
-  is what still lets *both* tables stay resident at MC=68 with a 16K-entry
-  table (measured 0.65 ms vs 1.79 ms when the map falls back to GM reads).
-  Only tables whose single copy cannot fit at BLOCK=64 (>= 128K entries) take
-  the all-GM path; two copies stop fitting at >= 32K entries, which is where
-  the prob-only path takes over.
+  _UB_BUDGET_BYTES``).  With the 32-byte extent the break-even points are
+  smooth instead of stepping with the power-of-two ladder: two tables stay
+  resident up to ~21.7K entries at MC<=8 (~17.8K at MC=68), one table up to
+  ~43.4K / ~35.7K, and only beyond that does the all-GM path take over.
   The ladder is walked **independently of the batch size**: ``BLOCK``,
   ``PROB_UB`` and ``MAP_UB`` are ``tl.constexpr`` and therefore part of the
   compilation cache key, so deriving them from ``N`` would recompile the kernel
@@ -95,7 +104,22 @@ _CHUNK_UNROLL: tl.constexpr = 4
 
 
 def _ub_need(pad_tab, mc, block, tables):
-    """Bytes of UB: `tables` fp32 tables plus the live vectors of the gather chain."""
+    """Bytes of UB: `tables` fp32 tables plus the live vectors of the gather chain.
+
+    The table term is exact (``4 * pad_tab`` per resident table, ``pad_tab`` being
+    a 32B multiple).  The vector term is the measured fit of the unrolled gather
+    chain: ``2*mc + 10`` live ``[BLOCK]`` vectors covers the two accumulators of
+    each stage plus the temporaries the compiler multi-buffers.
+
+    Reference points (budget 176 KiB, verified by compilation):
+
+    * ``pad=4608, mc=72`` -> 2 tables @128 = 113 KiB, 1 table @256 = 88 KiB;
+    * ``pad=8704, mc=68`` -> 2 tables @128 = 141 KiB (was 205 KiB, i.e. forced
+      ``BLOCK=64``, before the table extent stopped being rounded to a power of 2);
+    * ``pad=17408, mc=68`` -> 2 tables @64 = 173 KiB (was single-table only);
+    * ``pad=32768, mc=8`` -> 1 table @256 = 154 KiB, 2 tables do not fit at any
+      ladder width.
+    """
     return 4 * tables * pad_tab + 4 * block * (2 * mc + 10)
 
 
@@ -126,11 +150,23 @@ def _num_vectorcore(device_index):
     return _FALLBACK_VEC_CORES
 
 
-def _next_pow2(n, floor=16):
-    p = floor
-    while p < n:
-        p *= 2
-    return p
+def _pad_table(tab):
+    """Extent of the UB-resident table tile: ``tab`` rounded up to 32 bytes.
+
+    Triton's documented "``tl.arange`` range must be a power of two" rule is only
+    enforced by this backend under ``compile_mode="simt_only"`` (see
+    ``triton/language/semantic.py``: the check sits behind ``builder.is_simt_mode()``).
+    In the default (auto) mode an arbitrary extent compiles, so the tile only has
+    to satisfy the hardware's 32-byte access granule: ``8`` fp32 lanes.
+
+    Rounding to the next power of two instead costs up to 1.8x of the table's real
+    size in UB (e.g. 4608 -> 8192, 8704 -> 16384), which is charged against the
+    same budget that decides ``BLOCK`` and whether the map table may stay resident.
+    The tail ``[tab, pad_tab)`` is masked on load and is unreachable by any gather
+    index (all indices are ``lid*MC + c < tab``), so the extent is free to be any
+    32B multiple >= 16.
+    """
+    return max(16, (tab + 7) // 8 * 8)
 
 
 @triton.jit
@@ -317,7 +353,7 @@ class ModelNew(nn.Module):
         # depends only on the table geometry, never on `n`, so a serving run
         # compiles this kernel exactly once.
         tab = num_logical * max_copies
-        pad_tab = _next_pow2(tab)
+        pad_tab = _pad_table(tab)
         prob_ub = map_ub = False
         picked = _pick_block(pad_tab, max_copies, 2)
         if picked is not None:
