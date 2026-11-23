@@ -11,6 +11,7 @@ register_npu_ci(est_time=1, suite="extra-a-test-npu")
 # Initialize the quantization registry as in model-config loading.
 import sglang.srt.layers.quantization  # noqa: F401
 from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
+    NPUMXFP8LinearMethod,
     npu_w8a8_mxfp8_linear,
 )
 from sglang.srt.hardware_backend.npu.quantization.linear_utils import (
@@ -160,6 +161,44 @@ class TestNPUW8A8BlockFP8Linear(unittest.TestCase):
         quant_bias = npu_ops.npu_quant_matmul.call_args.kwargs["bias"]
         self.assertEqual(quant_bias.dtype, torch.float32)
         torch.testing.assert_close(quant_bias, bias.float())
+
+    def test_convert_weight_to_nz_casts_contiguous_k_major_copy(self):
+        # process_npu_arch35_mxfp8_linear_weights hands back [in, out] as a
+        # strided view of the row-major [out, in] payload; the NZ cast must see
+        # a contiguous K-major copy, not that transpose view.
+        source = torch.randint(0, 256, (64, 128), dtype=torch.uint8).view(
+            torch.float8_e4m3fn
+        )
+        layer = SimpleNamespace(
+            weight=torch.nn.Parameter(source.transpose(0, 1), requires_grad=False)
+        )
+
+        def fake_format_cast(tensor):
+            self.assertTrue(tensor.is_contiguous())
+            self.assertEqual(tuple(tensor.shape), (128, 64))
+            expected = source.transpose(0, 1).contiguous()
+            self.assertTrue(
+                torch.equal(tensor.view(torch.uint8), expected.view(torch.uint8))
+            )
+            return torch.empty_like(tensor)
+
+        with patch(
+            "sglang.srt.hardware_backend.npu.quantization.linear_method_npu.npu_format_cast",
+            side_effect=fake_format_cast,
+        ):
+            NPUMXFP8LinearMethod.convert_weight_to_nz(layer)
+
+        self.assertEqual(tuple(layer.weight.shape), (128, 64))
+        self.assertEqual(layer.weight.dtype, torch.float8_e4m3fn)
+
+    def test_convert_weight_to_nz_rejects_non_fp8(self):
+        layer = SimpleNamespace(
+            weight=torch.nn.Parameter(
+                torch.empty(128, 64, dtype=torch.bfloat16), requires_grad=False
+            )
+        )
+        with self.assertRaisesRegex(ValueError, "expects an MXFP8"):
+            NPUMXFP8LinearMethod.convert_weight_to_nz(layer)
 
 
 if __name__ == "__main__":

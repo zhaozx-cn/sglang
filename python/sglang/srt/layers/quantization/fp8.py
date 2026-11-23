@@ -845,6 +845,9 @@ class Fp8LinearMethod(LinearMethodBase):
                 or envs.SGLANG_NPU_ARCH35_REQUANT_BLOCK_FP8.get()
             )
         ):
+            from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
+                NPUMXFP8LinearMethod,
+            )
             from sglang.srt.hardware_backend.npu.quantization.linear_utils import (
                 process_npu_arch35_mxfp8_linear_weights,
             )
@@ -854,6 +857,18 @@ class Fp8LinearMethod(LinearMethodBase):
                 self.weight_block_size,
                 scale_fmt=self.quant_config.scale_fmt,
             )
+            # Plain e4m3 block scales were just requantized to MXFP8. Hand the
+            # dense MXFP8 GEMM the same FRACTAL_NZ weight layout vllm-ascend
+            # installs, matching the MoE MXFP8 path. UE8M0 checkpoints already
+            # carry a layout consumed directly (and batched wo_a rebuilds it), so
+            # they stay ND; likewise layers that another kernel reads in plain
+            # layout must not be retiled.
+            if (
+                self.quant_config.scale_fmt != "ue8m0"
+                and not getattr(layer, "keep_plain_weight_layout", False)
+                and not getattr(layer, "_dsv4_npu_arch35_mxfp8_wo_a", False)
+            ):
+                NPUMXFP8LinearMethod.convert_weight_to_nz(layer)
             return
         # If ROCm, normalize the weights and scales to e4m3fnuz
         if _is_fp8_fnuz:

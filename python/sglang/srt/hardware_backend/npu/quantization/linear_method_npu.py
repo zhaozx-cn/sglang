@@ -229,10 +229,45 @@ class NPUMXFP8LinearMethod(_NPULinearMethodBase):
         # row-major source gives stride-1 access for that scan via the transpose
         # view, matching msmodelslim's offline layout. Calling .contiguous()
         # physically reorders to [in, out] row-major, making the inner-loop stride
-        # equal to out and tanking HBM bandwidth.
+        # equal to out and tanking HBM bandwidth. (The opt-in NZ layout is the
+        # exception: ``convert_weight_to_nz`` must retile a contiguous copy.)
 
         # Cache FP32 bias once to avoid a per-forward dtype conversion + alloc.
         cache_linear_bias_fp32(layer)
+
+    @staticmethod
+    def convert_weight_to_nz(layer: torch.nn.Module) -> None:
+        """Re-lay an MXFP8 weight into FRACTAL_NZ for ``npu_quant_matmul``.
+
+        Ascend 950 runs the dense MXFP8 GEMM directly on an NZ weight, which is
+        what vllm-ascend installs from its ``process_weights_after_loading``
+        (``maybe_trans_nz(weight.transpose(0, 1).contiguous(),
+        customize_dtype=torch.float8_e4m3fn)``). SGLang's block-FP8 requant path
+        (``process_npu_arch35_mxfp8_linear_weights``) stops at MXFP8, so callers
+        that want the NZ layout invoke this after that conversion.
+
+        The input weight is a strided ``[in, out]`` view of the row-major
+        ``[out, in]`` payload. ``npu_format_cast`` retiles the backing storage,
+        so it must run on a contiguous K-major copy: casting the transpose view
+        would retile the wrong axis. The logical ``[in, out]`` shape (and the
+        FP8 matmul's ``weight_scale_inv`` scale) are unchanged; only the storage
+        format changes, which the GEMM detects per operand.
+
+        The scale is deliberately left in ND; NZ only applies to the weight.
+
+        This is opt-in (``SGLANG_NPU_ARCH35_REQUANT_BLOCK_FP8``) and must be
+        skipped for layers whose weight another kernel reads in plain layout
+        (see ``keep_plain_weight_layout`` / DeepSeek-V4 ``wo_a``).
+        """
+        weight = layer.weight.data
+        if weight.dtype != torch.float8_e4m3fn:
+            raise ValueError(
+                "convert_weight_to_nz expects an MXFP8 float8_e4m3fn weight, "
+                f"got {weight.dtype}."
+            )
+        # npu_format_cast falls back to ND for shapes the NZ tiling cannot hold
+        # (e.g. N not a multiple of 32), so the matmul still sees a valid weight.
+        layer.weight.data = npu_format_cast(weight.contiguous())
 
     def apply(
         self,
