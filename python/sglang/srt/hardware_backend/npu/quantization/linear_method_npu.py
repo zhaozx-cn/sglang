@@ -255,6 +255,14 @@ class NPUMXFP8LinearMethod(_NPULinearMethodBase):
 
         The scale is deliberately left in ND; NZ only applies to the weight.
 
+        ``npu_quant_matmul`` asserts that ``x2`` (weight) and its scale carry
+        the same transpose flag. The NZ cast yields a non-transposed weight, so
+        the scale's strided ``[in // 64, out, 2]`` transpose view must be
+        materialized: vllm-ascend does the same with
+        ``layer._mxfp8_scale_buf = target_scale.contiguous()``. Leaving it as a
+        view fails with "Input x2 tensor and scale tensor's transpose are not
+        same".
+
         This is opt-in (``SGLANG_NPU_ARCH35_REQUANT_BLOCK_FP8``) and must be
         skipped for layers whose weight another kernel reads in plain layout
         (see ``keep_plain_weight_layout`` / DeepSeek-V4 ``wo_a``).
@@ -266,8 +274,22 @@ class NPUMXFP8LinearMethod(_NPULinearMethodBase):
                 f"got {weight.dtype}."
             )
         # npu_format_cast falls back to ND for shapes the NZ tiling cannot hold
-        # (e.g. N not a multiple of 32), so the matmul still sees a valid weight.
-        layer.weight.data = npu_format_cast(weight.contiguous())
+        # (e.g. N not a multiple of 32) or when the cast is disabled, returning
+        # the input unchanged. Detect that by identity: only a real NZ retile
+        # flips the weight's transpose flag, so only then must the scale follow.
+        # On a skip, keep the original transposed weight view (its transpose flag
+        # already matches the scale view) instead of installing the copy.
+        contiguous_weight = weight.contiguous()
+        nz_weight = npu_format_cast(contiguous_weight)
+        if nz_weight is contiguous_weight:
+            return
+        layer.weight.data = nz_weight
+
+        # Match the weight's transpose flag: drop the [in // 64, out, 2]
+        # transpose view and keep a contiguous scale, as the GEMM requires.
+        scale = getattr(layer, "weight_scale_inv", None)
+        if scale is not None:
+            scale.data = scale.data.contiguous()
 
     def apply(
         self,

@@ -169,8 +169,12 @@ class TestNPUW8A8BlockFP8Linear(unittest.TestCase):
         source = torch.randint(0, 256, (64, 128), dtype=torch.uint8).view(
             torch.float8_e4m3fn
         )
+        scale_nd = torch.arange(64 * 2 * 2, dtype=torch.uint8).reshape(64, 2, 2)
         layer = SimpleNamespace(
-            weight=torch.nn.Parameter(source.transpose(0, 1), requires_grad=False)
+            weight=torch.nn.Parameter(source.transpose(0, 1), requires_grad=False),
+            weight_scale_inv=torch.nn.Parameter(
+                scale_nd.transpose(0, 1), requires_grad=False
+            ),
         )
 
         def fake_format_cast(tensor):
@@ -190,6 +194,37 @@ class TestNPUW8A8BlockFP8Linear(unittest.TestCase):
 
         self.assertEqual(tuple(layer.weight.shape), (128, 64))
         self.assertEqual(layer.weight.dtype, torch.float8_e4m3fn)
+        # The GEMM requires x2 and scale to agree on their transpose flag; the
+        # NZ weight is non-transposed, so the scale must be materialized.
+        self.assertTrue(layer.weight_scale_inv.data.is_contiguous())
+        self.assertTrue(
+            torch.equal(
+                layer.weight_scale_inv.data, scale_nd.transpose(0, 1).contiguous()
+            )
+        )
+
+    def test_convert_weight_to_nz_keeps_scale_view_when_cast_skipped(self):
+        # An ND fallback (disabled // unaligned) leaves the weight a transpose
+        # view, so the transposed scale view already matches and must stay one.
+        source = torch.randint(0, 256, (64, 128), dtype=torch.uint8).view(
+            torch.float8_e4m3fn
+        )
+        scale_nd = torch.arange(64 * 2 * 2, dtype=torch.uint8).reshape(64, 2, 2)
+        layer = SimpleNamespace(
+            weight=torch.nn.Parameter(source.transpose(0, 1), requires_grad=False),
+            weight_scale_inv=torch.nn.Parameter(
+                scale_nd.transpose(0, 1), requires_grad=False
+            ),
+        )
+
+        with patch(
+            "sglang.srt.hardware_backend.npu.quantization.linear_method_npu.npu_format_cast",
+            side_effect=lambda tensor: tensor,
+        ):
+            NPUMXFP8LinearMethod.convert_weight_to_nz(layer)
+
+        self.assertFalse(layer.weight.data.is_contiguous())
+        self.assertFalse(layer.weight_scale_inv.data.is_contiguous())
 
     def test_convert_weight_to_nz_rejects_non_fp8(self):
         layer = SimpleNamespace(

@@ -859,7 +859,9 @@ class Fp8LinearMethod(LinearMethodBase):
             )
             # Plain e4m3 block scales were just requantized to MXFP8. Hand the
             # dense MXFP8 GEMM the same FRACTAL_NZ weight layout vllm-ascend
-            # installs, matching the MoE MXFP8 path. UE8M0 checkpoints already
+            # installs, matching the MoE MXFP8 path. The help also materializes
+            # weight_scale_inv so its transpose flag matches the retiled weight
+            # (npu_quant_matmul rejects a mismatch). UE8M0 checkpoints already
             # carry a layout consumed directly (and batched wo_a rebuilds it), so
             # they stay ND; likewise layers that another kernel reads in plain
             # layout must not be retiled.
