@@ -209,6 +209,28 @@ _GDN_FUSED_QKVZBA_RATIOS = (
     else (1, 2, 4)
 )
 
+
+def _gdn_stacked_params_mapping():
+    """Checkpoint-to-module mapping for the GDN input projections.
+
+    Ascend builds ``in_proj_qkv`` and ``in_proj_z`` as separate Linears, so
+    their GEMMs stay separate and the split/reshape kernel is not needed; both
+    load straight from their checkpoint names. Other backends keep the fused
+    ``in_proj_qkvz`` module and split the checkpoint's shards into it.
+    """
+    if _is_npu:
+        return [
+            ("in_proj_ba.", "in_proj_b.", 0),
+            ("in_proj_ba.", "in_proj_a.", 1),
+        ]
+    return [
+        ("in_proj_qkvz.", "in_proj_qkv.", (0, 1, 2)),
+        ("in_proj_qkvz.", "in_proj_z.", 3),
+        ("in_proj_ba.", "in_proj_b.", 0),
+        ("in_proj_ba.", "in_proj_a.", 1),
+    ]
+
+
 cached_get_processor = lru_cache(get_processor)
 
 
@@ -390,14 +412,37 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         self.conv1d.weight.data = self.conv1d.weight.data.unsqueeze(1)
 
         # projection of the input hidden states
-        self.in_proj_qkvz = self.create_qkvz_proj(
-            hidden_size=self.hidden_size,
-            key_dim=self.key_dim,
-            value_dim=self.value_dim,
-            quant_config=quant_config,
-            prefix=add_prefix("in_proj_qkvz", prefix),
-            parallel_group=parallel_group,
-        )
+        # On Ascend the qkv and z GEMMs stay separate: one merged GEMM would
+        # need the costly split/reshape kernel to recover `mixed_qkv` and `z`,
+        # while two GEMMs already produce the layout the GDN consumers want.
+        # Only `in_proj_ba` still needs a split afterwards.
+        self._split_qkvz_in_proj = _is_npu
+        if self._split_qkvz_in_proj:
+            self.in_proj_qkv = self.create_qkv_proj(
+                hidden_size=self.hidden_size,
+                key_dim=self.key_dim,
+                value_dim=self.value_dim,
+                quant_config=quant_config,
+                prefix=add_prefix("in_proj_qkv", prefix),
+                parallel_group=parallel_group,
+            )
+            self.in_proj_z = self.create_z_proj(
+                hidden_size=self.hidden_size,
+                value_dim=self.value_dim,
+                quant_config=quant_config,
+                prefix=add_prefix("in_proj_z", prefix),
+                parallel_group=parallel_group,
+            )
+            self.in_proj_qkvz = None
+        else:
+            self.in_proj_qkvz = self.create_qkvz_proj(
+                hidden_size=self.hidden_size,
+                key_dim=self.key_dim,
+                value_dim=self.value_dim,
+                quant_config=quant_config,
+                prefix=add_prefix("in_proj_qkvz", prefix),
+                parallel_group=parallel_group,
+            )
 
         self.in_proj_ba = self.create_ba_proj(
             hidden_size=self.hidden_size,
@@ -410,7 +455,10 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         # Override weight loaders for packed checkpoint format.
         # Important: for FP8, this must cover not only `.weight` but also
         # `weight_scale_inv` / `weight_scale` / `input_scale` if present.
-        self._bind_packed_weight_loaders(self.in_proj_qkvz)
+        if self._split_qkvz_in_proj:
+            self._bind_packed_weight_loaders(self.in_proj_qkv)
+        else:
+            self._bind_packed_weight_loaders(self.in_proj_qkvz)
         self._bind_packed_weight_loaders(self.in_proj_ba)
         self._fused_in_proj_weight: Optional[torch.Tensor] = None
         self._fused_in_proj_qkvz_width = 0
@@ -679,6 +727,43 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             parallel_group=parallel_group,
         )
 
+    def create_qkv_proj(
+        self,
+        hidden_size: int,
+        key_dim: int,
+        value_dim: int,
+        quant_config: QuantizationConfig | None,
+        prefix: str,
+        *,
+        parallel_group: LinearParallelGroup = "tp",
+    ) -> MergedColumnParallelLinear:
+        return MergedColumnParallelLinear(
+            input_size=hidden_size,
+            output_sizes=[key_dim, key_dim, value_dim],
+            bias=False,
+            quant_config=quant_config,
+            prefix=prefix,
+            parallel_group=parallel_group,
+        )
+
+    def create_z_proj(
+        self,
+        hidden_size: int,
+        value_dim: int,
+        quant_config: QuantizationConfig | None,
+        prefix: str,
+        *,
+        parallel_group: LinearParallelGroup = "tp",
+    ) -> ColumnParallelLinear:
+        return ColumnParallelLinear(
+            input_size=hidden_size,
+            output_size=value_dim,
+            bias=False,
+            quant_config=quant_config,
+            prefix=prefix,
+            parallel_group=parallel_group,
+        )
+
     def create_ba_proj(
         self,
         hidden_size: int,
@@ -845,6 +930,16 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         )
 
     def _forward_input_proj(self, hidden_states: torch.Tensor):
+        if getattr(self, "_split_qkvz_in_proj", False):
+            # Ascend: keep the qkv and z GEMMs separate and return them in the
+            # layout the GDN consumers expect, so no split/reshape is needed for
+            # the large projection. Only the small b/a projection is unpacked.
+            if isinstance(hidden_states, tuple):
+                hidden_states = hidden_states[0]
+            projected_states_qkv, _ = self.in_proj_qkv(hidden_states)
+            projected_states_z, _ = self.in_proj_z(hidden_states)
+            projected_states_ba, _ = self.in_proj_ba(hidden_states)
+            return projected_states_qkv, projected_states_z, projected_states_ba
         if _use_aiter and self._fused_in_proj_weight is not None:
             # Unquantized BF16 projections consume the bf16 side of the fused
             # AR+RMSNorm tuple; one aiter GEMM replaces the two separate
@@ -986,9 +1081,18 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         2. Core attention (custom op)
         3. Output projection
         """
-        projected_states_qkvz, projected_states_ba = self._forward_input_proj(
-            hidden_states
-        )
+        split_qkvz_in_proj = getattr(self, "_split_qkvz_in_proj", False)
+        projected_states_qkvz = None
+        if split_qkvz_in_proj:
+            (
+                projected_states_qkv,
+                projected_states_z,
+                projected_states_ba,
+            ) = self._forward_input_proj(hidden_states)
+        else:
+            projected_states_qkvz, projected_states_ba = self._forward_input_proj(
+                hidden_states
+            )
 
         use_strided_prefill_z = False
         packed_verify = False
@@ -999,16 +1103,29 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             backend = getattr(backend, "linear_attn_backend", backend)
             packed_verify = getattr(backend, "supports_packed_verify", False)
         use_fused_proj_conv = (
-            _gdn_decode_fused_proj_conv
+            not split_qkvz_in_proj
+            and _gdn_decode_fused_proj_conv
             and not (_is_xpu and get_exec().mamba.linear_attn_backend == "intel_xpu")
             and (forward_batch.forward_mode.is_decode() or packed_verify)
             and isinstance(projected_states_qkvz, torch.Tensor)
             and isinstance(projected_states_ba, torch.Tensor)
         )
         use_fused_contiguous_unpack = (
-            self.num_v_heads // self.num_k_heads in _GDN_FUSED_QKVZBA_RATIOS
+            not split_qkvz_in_proj
+            and self.num_v_heads // self.num_k_heads in _GDN_FUSED_QKVZBA_RATIOS
         )
-        if use_fused_proj_conv:
+        if split_qkvz_in_proj:
+            # The qkv/z GEMMs already produced the layouts the GDN consumers
+            # take; only b/a need unpacking from the packed projection.
+            mixed_qkv = projected_states_qkv
+            z = projected_states_z.reshape(
+                projected_states_z.shape[0], -1, self.head_v_dim
+            )
+            num_v_heads_tp = self.num_v_heads // self.attn_tp_size
+            b, a = projected_states_ba.split([num_v_heads_tp, num_v_heads_tp], dim=-1)
+            b = b.contiguous()
+            a = a.contiguous()
+        elif use_fused_proj_conv:
             # GDN owns indexed Conv1D state and the safe unpack/Conv boundary;
             # it replaces these temporary B/A placeholders before recurrence.
             mixed_qkv = (projected_states_qkvz, projected_states_ba)
@@ -1170,7 +1287,12 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         # GDN layers need both bf16 (for the small in_proj_ba gating
         # projection) and a quantized tuple only when in_proj_qkvz can consume
         # it. Otherwise, stay on the plain AR+RMSNorm path.
-        accepts_fp8_input = _linear_accepts_fp8_tuple(self.linear_attn.in_proj_qkvz)
+        qkvz_proj = (
+            self.linear_attn.in_proj_qkv
+            if self.linear_attn._split_qkvz_in_proj
+            else self.linear_attn.in_proj_qkvz
+        )
+        accepts_fp8_input = _linear_accepts_fp8_tuple(qkvz_proj)
         boundary_fusions = _layer_fusions(config, is_nextn)
         # A subclass that brings its own residual builds the stages itself.
         if build_stages:
@@ -1998,10 +2120,7 @@ class Qwen3_5ForCausalLM(nn.Module):
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
             # GDN
-            ("in_proj_qkvz.", "in_proj_qkv.", (0, 1, 2)),
-            ("in_proj_qkvz.", "in_proj_z.", 3),
-            ("in_proj_ba.", "in_proj_b.", 0),
-            ("in_proj_ba.", "in_proj_a.", 1),
+            *_gdn_stacked_params_mapping(),
         ]
 
         loaded_params: Set[str] = set()
@@ -2110,10 +2229,7 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
             # GDN
-            ("in_proj_qkvz.", "in_proj_qkv.", (0, 1, 2)),
-            ("in_proj_qkvz.", "in_proj_z.", 3),
-            ("in_proj_ba.", "in_proj_b.", 0),
-            ("in_proj_ba.", "in_proj_a.", 1),
+            *_gdn_stacked_params_mapping(),
         ]
 
         num_experts = self.config.num_experts
@@ -2473,10 +2589,7 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
             # GDN fused projections
-            ("in_proj_qkvz.", "in_proj_qkv.", (0, 1, 2)),
-            ("in_proj_qkvz.", "in_proj_z.", 3),
-            ("in_proj_ba.", "in_proj_b.", 0),
-            ("in_proj_ba.", "in_proj_a.", 1),
+            *_gdn_stacked_params_mapping(),
         ]
 
         loaded_params: Set[str] = set()
@@ -2690,10 +2803,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
             # GDN fused projections
-            ("in_proj_qkvz.", "in_proj_qkv.", (0, 1, 2)),
-            ("in_proj_qkvz.", "in_proj_z.", 3),
-            ("in_proj_ba.", "in_proj_b.", 0),
-            ("in_proj_ba.", "in_proj_a.", 1),
+            *_gdn_stacked_params_mapping(),
         ]
 
         num_experts = self.config.num_experts

@@ -92,6 +92,7 @@ from sglang.srt.models.qwen3_5 import (
     Qwen3_5ForCausalLM,
     Qwen3_5GatedDeltaNet,
     Qwen3_5LinearDecoderLayer,
+    _gdn_stacked_params_mapping,
     _qwen3_5_is_moe,
 )
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
@@ -2602,10 +2603,7 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
             ("gate_up_proj", "up_proj", 1),
             # Checkpoints use the qwen3.5 head-first in_proj layout,
             # matching Qwen3_5GatedDeltaNet's forward, not qwen3-next's group-first.
-            ("in_proj_qkvz.", "in_proj_qkv.", (0, 1, 2)),
-            ("in_proj_qkvz.", "in_proj_z.", 3),
-            ("in_proj_ba.", "in_proj_b.", 0),
-            ("in_proj_ba.", "in_proj_a.", 1),
+            *_gdn_stacked_params_mapping(),
         ]
 
         num_experts = getattr(self.config, "num_experts", None)
