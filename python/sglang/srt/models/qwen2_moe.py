@@ -443,6 +443,27 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         self._mega_intermediate_size = config.moe_intermediate_size
         self._mega_hidden_size = config.hidden_size
 
+        # Fine-grained Ascend dual stream: split the dense shared expert into
+        # Cube/Vector stages and overlap each with a routed stage that uses the
+        # other unit (see hardware_backend/npu/moe/dual_stream.py). Stream and
+        # event based, so the same path runs eagerly and under graph replay.
+        self._npu_dual_stream = None
+        if (
+            _is_npu
+            and self.shared_expert is not None
+            and (
+                envs.SGLANG_NPU_FINE_GRAINED_MOE_DUAL_STREAM.get()
+                # Keep the legacy qwen2-MoE opt-in working; it used to overlap
+                # only under graph capture, the new schedule also runs eager.
+                or envs.SGLANG_NPU_USE_MULTI_STREAM.get()
+            )
+        ):
+            from sglang.srt.hardware_backend.npu.moe.dual_stream import (
+                FineGrainedMoEDualStream,
+            )
+
+            self._npu_dual_stream = FineGrainedMoEDualStream()
+
     def get_moe_weights(self):
         return [
             x.data
@@ -585,6 +606,79 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
 
         return shared_output
 
+    # ------------------------------------------------------------------
+    # Fine-grained NPU shared-expert stages (npu/moe/dual_stream.py)
+    # ------------------------------------------------------------------
+    def _npu_shared_gate_up(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Shared-expert Gate-Up (Cube), queued on the auxiliary stream."""
+        gate_up, _ = self.shared_expert.gate_up_proj(hidden_states)
+        return gate_up
+
+    def _npu_shared_act(self, gate_up: torch.Tensor) -> torch.Tensor:
+        """Shared-expert activation (Vector), overlapped with routed Cube."""
+        return self.shared_expert.act_fn(gate_up)
+
+    def _npu_shared_down(self, activated: torch.Tensor) -> torch.Tensor:
+        """Shared-expert Down projection (Cube), the tail of the aux MLP."""
+        down, _ = self.shared_expert.down_proj(activated)
+        return down
+
+    def _npu_apply_shared_gate(
+        self, hidden_states: torch.Tensor, shared_output: torch.Tensor
+    ) -> torch.Tensor:
+        """Apply the dense shared-expert gate on the auxiliary stream."""
+        if self.shared_expert_gate is None:
+            return shared_output
+        from sgl_kernel_npu.operators.activation import (
+            fused_sigmoid_mul_broadcast,
+        )
+
+        gate = self.shared_expert_gate(hidden_states)
+        if isinstance(gate, tuple):
+            gate = gate[0]
+        return fused_sigmoid_mul_broadcast(shared_output, gate)
+
+    def _forward_npu_dual_stream(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        use_fused_gate: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Overlap the routed experts with a finely split shared expert.
+
+        Runs in eager mode and inside graph capture alike: the schedule uses
+        only streams and events, never host synchronization or data-dependent
+        branches.
+        """
+        assert self._npu_dual_stream is not None
+        dual = self._npu_dual_stream
+
+        prepared = dual.prepare_input(hidden_states, torch.clone)
+        # Router (Cube) first, then submit shared Gate-Up behind it so both
+        # Cube matmuls do not compete for the same unit.
+        router_logits, _ = self.gate(hidden_states)
+        submitted_gate_up = dual.submit_gate_up(
+            prepared,
+            self._npu_shared_gate_up,
+            after=dual.record_router_output(),
+        )
+
+        final_hidden_states = self._forward_router_experts(
+            hidden_states, router_logits=router_logits
+        )
+
+        shared_output, shared_ready = dual.finish(
+            submitted_gate_up,
+            self._npu_shared_act,
+            self._npu_shared_down,
+            # Gate the clone taken before the routed experts ran, so an
+            # in-place routed update cannot be observed by the shared branch.
+            hidden_states=prepared.hidden_states,
+            apply_gate_fn=None if use_fused_gate else self._npu_apply_shared_gate,
+        )
+        dual.join(shared_ready)
+        return final_hidden_states, shared_output
+
     def _forward_deepep(self, hidden_states: torch.Tensor, forward_batch: ForwardBatch):
         trace_e2e = envs.SGLANG_TRACE_QWEN_MOE_DEEPEP_E2E.get()
 
@@ -603,11 +697,10 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 flush=True,
             )
 
-        enable_dual_stream = (
-            is_npu()
-            and envs.SGLANG_NPU_USE_MULTI_STREAM.get()
-            and forward_batch.forward_mode.is_cuda_graph()
-        )
+        # Fine-grained Ascend dual stream. It is stream/event based, so the
+        # same schedule runs eagerly and under graph replay: the shared expert
+        # no longer needs to be gated on cuda-graph mode.
+        npu_dual_stream = self._npu_dual_stream
         enable_cuda_shared_overlap = (
             _is_cuda
             and envs.SGLANG_ENABLE_QWEN_DEEPEP_SHARED_OVERLAP.get()
@@ -619,17 +712,22 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             and hidden_states.shape[0] > 0
         )
         shared_output = None
+        submitted_gate_up = None
         if hidden_states.shape[0] > 0:
+            prepared_shared_input = (
+                npu_dual_stream.prepare_input(hidden_states, torch.clone)
+                if npu_dual_stream is not None
+                else None
+            )
             # router_logits: (num_tokens, n_experts)
             router_logits, _ = self.gate(hidden_states)
-            if enable_dual_stream:
-                from sglang.srt.hardware_backend.npu.cmo import (
-                    shared_expert_on_independent_stream,
-                    wait_share_stream,
-                )
-
-                shared_output = shared_expert_on_independent_stream(
-                    hidden_states.clone(), self._forward_shared_experts
+            if npu_dual_stream is not None:
+                # Gate-Up is Cube work: hold it until the router Cube matmul is
+                # queued, then let it cover the Vector TopK/routing window.
+                submitted_gate_up = npu_dual_stream.submit_gate_up(
+                    prepared_shared_input,
+                    self._npu_shared_gate_up,
+                    after=npu_dual_stream.record_router_output(),
                 )
             elif enable_cuda_shared_overlap:
                 current_stream = torch.cuda.current_stream()
@@ -653,8 +751,16 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             topk_output=topk_output,
         )
         trace_sync("post_experts")
-        if enable_dual_stream:
-            wait_share_stream()
+        if npu_dual_stream is not None and submitted_gate_up is not None:
+            assert prepared_shared_input is not None
+            shared_output, shared_ready = npu_dual_stream.finish(
+                submitted_gate_up,
+                self._npu_shared_act,
+                self._npu_shared_down,
+                hidden_states=prepared_shared_input.hidden_states,
+                apply_gate_fn=self._npu_apply_shared_gate,
+            )
+            npu_dual_stream.join(shared_ready)
         elif enable_cuda_shared_overlap:
             torch.cuda.current_stream().wait_event(shared_event)
 
@@ -729,13 +835,15 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         hidden_states: torch.Tensor,
         *,
         defer_finalize: bool = False,
+        router_logits: Optional[torch.Tensor] = None,
     ):
         if _use_aiter and self.enable_shared_expert_fusion and not defer_finalize:
             topk_output = _smallm_router_topk_output(self, hidden_states)
             if topk_output is not None:
                 return self.experts(hidden_states, topk_output)
         # router_logits: (num_tokens, n_experts)
-        router_logits, _ = self.gate(hidden_states)
+        if router_logits is None:
+            router_logits, _ = self.gate(hidden_states)
         topk_output = self.topk(hidden_states, router_logits)
         if defer_finalize:
             if not self.supports_deferred_finalize:
@@ -865,6 +973,20 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             shared_output = None
             topk_output = self.topk.empty_topk_output(hidden_states.device)
             final_hidden_states = self.experts(hidden_states, topk_output)
+        elif (
+            self._npu_dual_stream is not None
+            and not defer_finalize
+            and not torch.compiler.is_compiling()
+            # Paged experts run as an eager break, which must end the segment on
+            # the capture stream.
+            and not (
+                get_exec().moe.enable_paged_experts and is_in_breakable_cuda_graph()
+            )
+        ):
+            final_hidden_states, shared_output = self._forward_npu_dual_stream(
+                hidden_states,
+                use_fused_gate=use_fused_gate,
+            )
         elif (
             self.alt_stream is not None
             and get_is_capture_mode()

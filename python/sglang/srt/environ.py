@@ -1296,8 +1296,10 @@ class Envs:
     # explicitly for performance after validating workload accuracy.
     SGLANG_NPU_ARCH35_REQUANT_BLOCK_FP8 = EnvBool(False)
     SGLANG_NPU_USE_MULTI_STREAM = EnvBool(False)
-    # Kimi-K3 attention-TP shared experts: overlap AG / MLP / RS with the
-    # routed front / DeepEP dispatch / routed GEMMs, respectively.
+    # Fine-grained shared-expert / routed-MoE dual stream: overlap the shared
+    # MLP stages (Gate-Up / activation / Down) with routed stages that use the
+    # other Ascend unit. Used by Kimi-K3 (AG/MLP/RS vs routed front/dispatch/
+    # GEMM) and Qwen2-MoE (in eager mode and under graph replay).
     SGLANG_NPU_FINE_GRAINED_MOE_DUAL_STREAM = EnvBool(False)
     SGLANG_NPU_USE_MLAPO = EnvBool(False)
     # Fuse grouped Kimi-K3 SiTU with valid-row MXFP8 quantization before GMM2.
