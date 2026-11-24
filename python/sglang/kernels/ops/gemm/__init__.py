@@ -58,10 +58,11 @@ def npu_w8a8_block_fp8_linear(
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
     bias: torch.Tensor | None = None,
+    input_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Ascend arch35 BF16/FP16 Linear with 128x128 FP8 weights and FP32 scales."""
     return get_kernel("gemm.npu_w8a8_block_fp8_linear", KernelBackend.TORCH_NPU)(
-        input, weight, weight_scale, bias
+        input, weight, weight_scale, bias, input_scale
     )
 
 

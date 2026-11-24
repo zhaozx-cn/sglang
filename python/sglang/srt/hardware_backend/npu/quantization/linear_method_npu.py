@@ -400,27 +400,35 @@ def npu_w8a8_mxfp8_linear(
     """Block-FP8 linear on Ascend 950, used as the ``w8a8_block_fp8_linear``
     backend on NPU (see ``fp8_utils._dispatch_auto_backend``).
 
-    The loading path requantizes block-FP8 weights into the Ascend 950 MXFP8 layout;
-    activations are quantized per call. ``block_size`` is retained for the shared
-    block-FP8 backend interface and ``input_scale`` is unused because activation
-    scales are always dynamic here.
+    The loading path requantizes block-FP8 weights into the Ascend 950 MXFP8 layout.
+    Activations are quantized per call unless the caller already did it:
+    ``prepare_input_for_overlap`` may pass the matching ``(fp8, ue8m0 scale)``
+    pair as ``input``/``input_scale`` so the Vector work runs on another stream.
+    ``block_size`` is retained for the shared block-FP8 backend interface.
     """
     if weight.dtype != torch.float8_e4m3fn:
         raise ValueError(
             f"npu_w8a8_mxfp8_linear expects float8_e4m3fn weights, got {weight.dtype}"
         )
 
-    original_dtype = input.dtype
-    if original_dtype not in (torch.float16, torch.bfloat16):
-        input = input.to(torch.bfloat16)
+    if input_scale is not None:
+        # Pre-quantized activation. ``prepare_input_for_overlap`` only quantizes
+        # BF16 inputs, so the GEMM must return BF16 too.
         original_dtype = torch.bfloat16
+        orig_shape = input.shape
+        x_fp8, x_scale = input, input_scale
+    else:
+        original_dtype = input.dtype
+        if original_dtype not in (torch.float16, torch.bfloat16):
+            input = input.to(torch.bfloat16)
+            original_dtype = torch.bfloat16
 
-    orig_shape = input.shape
-    input_2d = input.view(-1, orig_shape[-1]).contiguous()
+        orig_shape = input.shape
+        input_2d = input.view(-1, orig_shape[-1]).contiguous()
 
-    x_fp8, x_scale = torch.ops.npu.npu_dynamic_mx_quant(
-        input_2d, dst_type=torch.float8_e4m3fn
-    )
+        x_fp8, x_scale = torch.ops.npu.npu_dynamic_mx_quant(
+            input_2d, dst_type=torch.float8_e4m3fn
+        )
     e8m0_dtype = _get_float8_e8m0fnu_dtype()
     quant_bias = (
         bias.to(torch.float32)

@@ -22,12 +22,22 @@ def npu_w8a8_block_fp8_linear(
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
     bias: Optional[torch.Tensor] = None,
+    input_scale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """BF16/FP16 input, 128x128 FP8 weights, and FP32 block scales."""
-    output_dtype = input.dtype
+    """BF16/FP16 input, 128x128 FP8 weights, and FP32 block scales.
+
+    ``input_scale`` carries a pre-quantized activation pair, letting a caller
+    hoist the per-row block quantization (Vector) onto another stream. It is
+    only produced for BF16 inputs, so the GEMM then returns BF16.
+    """
     output_shape = (*input.shape[:-1], weight.shape[0])
-    x = input.reshape(-1, input.shape[-1]).contiguous()
-    qx, x_scale = _quantize_input(x)
+    if input_scale is None:
+        output_dtype = input.dtype
+        x = input.reshape(-1, input.shape[-1]).contiguous()
+        qx, x_scale = _quantize_input(x)
+    else:
+        output_dtype = torch.bfloat16
+        qx, x_scale = input, input_scale
     output = torch.ops.npu.npu_quant_matmul(
         qx,
         weight.t(),

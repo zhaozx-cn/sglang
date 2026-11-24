@@ -1425,6 +1425,41 @@ class Fp8LinearMethod(LinearMethodBase):
             # Activations not quantized for marlin.
             del layer.input_scale
 
+    def prepare_input_for_overlap(
+        self, layer: torch.nn.Module, x: torch.Tensor
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+        """Pre-quantize an activation for a later ``apply`` call on Ascend NPU.
+
+        Ascend MoE dual streaming runs the shared expert's Vector activation
+        quantization on an auxiliary stream while the routed MoE uses the Cube
+        unit; the returned ``(quantized, scale)`` pair is what ``apply`` then
+        consumes. Only BF16 activations are handled because the tuple path pins
+        the GEMM output to BF16, matching the plain path there.
+        """
+        if not _is_npu or x.dtype != torch.bfloat16:
+            return None
+        x_2d = x.reshape(-1, x.shape[-1])
+        if self.use_npu_block_fp8:
+            # arch35 G-B kernel: per-row quantization in 128-wide blocks.
+            return torch.ops.npu.npu_dynamic_block_quant(
+                x_2d.contiguous(),
+                dst_type=torch.float8_e4m3fn,
+                row_block_size=1,
+                col_block_size=128,
+            )
+        if self.w8a8_block_fp8_linear is not None:
+            # Block-FP8 weights requantized to MXFP8 (ue8m0 checkpoints, or
+            # SGLANG_NPU_ARCH35_REQUANT_BLOCK_FP8) run the MXFP8 dense kernel.
+            from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
+                npu_w8a8_mxfp8_linear,
+            )
+
+            if self.w8a8_block_fp8_linear is npu_w8a8_mxfp8_linear:
+                return torch.ops.npu.npu_dynamic_mx_quant(
+                    x_2d, dst_type=torch.float8_e4m3fn
+                )
+        return None
+
     def apply(
         self,
         layer: torch.nn.Module,
@@ -1518,6 +1553,15 @@ class Fp8LinearMethod(LinearMethodBase):
 
         if self.block_quant:
             if self.use_npu_block_fp8:
+                if isinstance(x, tuple):
+                    # Pre-quantized by prepare_input_for_overlap.
+                    return self.w8a8_block_fp8_linear(
+                        input=x[0],
+                        weight=layer.weight,
+                        weight_scale=layer.weight_scale_inv,
+                        bias=bias,
+                        input_scale=x[1],
+                    )
                 return self.w8a8_block_fp8_linear(
                     input=x,
                     weight=layer.weight,
