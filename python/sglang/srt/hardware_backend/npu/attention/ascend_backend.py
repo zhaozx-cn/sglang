@@ -569,6 +569,31 @@ class AscendAttnBackend(AttentionBackend):
         v = layer.v_head_dim
         return (d == v and d in (128, 192, 256)) or (d == 192 and v == 128)
 
+    def _use_causal_decode_fia(
+        self,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+    ) -> bool:
+        # On A5, the TND causal path is faster than unmasked FIA for the
+        # Qwen3.5 BF16 GQA shape. A single decode query still sees all valid KV.
+        # Keep other shapes and attention semantics on their existing paths.
+        return (
+            forward_batch.forward_mode.is_decode()
+            and not layer.is_cross_attention
+            and layer.attn_type == AttentionType.DECODER
+            and layer.sliding_window_size == -1
+            and not self.use_alibi
+            and layer.logit_cap == 0
+            and layer.qk_head_dim == layer.v_head_dim == 256
+            and layer.tp_q_head_num == 8 * layer.tp_k_head_num
+            and self.page_size == 128
+            and q.dtype == k_cache.dtype == v_cache.dtype == torch.bfloat16
+            and is_npu_arch35()
+        )
+
     def uses_dcp_partial_attention(self, forward_batch: ForwardBatch) -> bool:
         """Whether this worker returns partial MLA attention for a DCP merge."""
         if self.dcp_size <= 1:
@@ -3969,7 +3994,19 @@ class AscendAttnBackend(AttentionBackend):
             v_cache = self.token_to_kv_pool.get_value_buffer(layer.layer_id).view(
                 -1, self.page_size, layer.tp_v_head_num * layer.v_head_dim
             )
-            query = q.reshape(-1, 1, layer.tp_q_head_num * layer.qk_head_dim)
+            use_causal_fia = self._use_causal_decode_fia(
+                q, k_cache, v_cache, layer, forward_batch
+            )
+            if use_causal_fia:
+                query = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
+                input_layout, sparse_mode = "TND", 3
+                attn_mask = self.fia_mask
+                # TND takes cumulative Q lengths, including one Q per padded row.
+                actual_seq_lengths = list(range(1, query.shape[0] + 1))
+            else:
+                query = q.reshape(-1, 1, layer.tp_q_head_num * layer.qk_head_dim)
+                input_layout, sparse_mode = "BSH", 0
+                actual_seq_lengths = None
             if seq_lens_cpu_int is None:
                 actual_seq_len_kv = seq_lens_cpu_list
             else:
@@ -3984,14 +4021,19 @@ class AscendAttnBackend(AttentionBackend):
                 block_size=self.page_size,
                 num_heads=layer.tp_q_head_num,
                 num_key_value_heads=layer.tp_k_head_num,
-                input_layout="BSH",
+                input_layout=input_layout,
                 scale=layer.scaling,
+                actual_seq_lengths=actual_seq_lengths,
                 actual_seq_lengths_kv=actual_seq_len_kv,
                 atten_mask=attn_mask,
-                sparse_mode=0,
+                sparse_mode=sparse_mode,
             )
             output = torch.empty(
-                (num_tokens, 1, layer.tp_q_head_num * layer.v_head_dim),
+                (
+                    (num_tokens, layer.tp_q_head_num, layer.v_head_dim)
+                    if use_causal_fia
+                    else (num_tokens, 1, layer.tp_q_head_num * layer.v_head_dim)
+                ),
                 dtype=q.dtype,
                 device=q.device,
             )
@@ -4004,11 +4046,12 @@ class AscendAttnBackend(AttentionBackend):
                 block_size=self.page_size,
                 num_heads=layer.tp_q_head_num,
                 num_key_value_heads=layer.tp_k_head_num,
-                input_layout="BSH",
+                input_layout=input_layout,
                 scale=layer.scaling,
+                actual_seq_lengths=actual_seq_lengths,
                 actual_seq_lengths_kv=actual_seq_len_kv,
                 atten_mask=attn_mask,
-                sparse_mode=0,
+                sparse_mode=sparse_mode,
                 workspace=workspace,
                 out=[output, softmax_lse],
             )
@@ -4369,13 +4412,14 @@ class AscendAttnBackend(AttentionBackend):
                 num_token_padding = q.shape[0]
                 actual_bs = self.forward_metadata.block_tables.shape[0]
                 q = q[:actual_bs]
+                use_causal_fia = self._use_causal_decode_fia(
+                    q, k_cache, v_cache, layer, forward_batch
+                )
+                query = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
+                if not use_causal_fia:
+                    query = query.unsqueeze(1)
                 attn_output, _ = torch.ops.npu.npu_fused_infer_attention_score(
-                    q.view(
-                        -1,
-                        1,
-                        layer.tp_q_head_num,
-                        layer.qk_head_dim,
-                    ),
+                    query,
                     k_cache.view(
                         -1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim
                     ),
@@ -4384,10 +4428,14 @@ class AscendAttnBackend(AttentionBackend):
                     ),
                     num_heads=layer.tp_q_head_num,
                     num_key_value_heads=layer.tp_k_head_num,
-                    input_layout="BSND",
-                    atten_mask=None,
+                    input_layout="TND" if use_causal_fia else "BSND",
+                    atten_mask=self.fia_mask if use_causal_fia else None,
+                    sparse_mode=3 if use_causal_fia else 0,
                     block_size=self.page_size,
                     block_table=self.forward_metadata.block_tables,
+                    actual_seq_lengths=(
+                        list(range(1, actual_bs + 1)) if use_causal_fia else None
+                    ),
                     actual_seq_lengths_kv=actual_seq_len_kv,
                     scale=layer.scaling,
                 )
