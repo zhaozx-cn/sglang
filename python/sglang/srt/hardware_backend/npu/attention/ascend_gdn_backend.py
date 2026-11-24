@@ -2,14 +2,10 @@ from typing import Optional, Tuple, Union
 
 import torch
 from sgl_kernel_npu.operators.attention.gdn import (
-    chunk_gated_delta_rule,
     fused_gdn_gating,
     fused_gdn_gating_without_sigmoid,
     recurrent_gated_delta_rule,
 )
-from sgl_kernel_npu.operators.attention.gdn.gdn_utils import prepare_chunk_indices
-from sgl_kernel_npu.operators.mamba import causal_conv1d
-from sgl_kernel_npu.operators.norm import l2norm_fwd
 
 from sglang.srt.hardware_backend.npu.attention.ascend_hybrid_linear_attn_backend import (
     AscendMambaAttnBackendBase,
@@ -78,6 +74,36 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
                 self.forward_metadata.query_start_loc
             ).to(torch.int32)
 
+        # The FLA launcher consumes host int arrays. Prepare them once per
+        # forward, rather than synchronizing the same sequence boundaries in
+        # every GDN layer. Decode and target verify keep their existing paths.
+        self.fla_cu_seqlens = None
+        self.fla_chunk_indices = None
+        self.fla_empty_seq_indices = None
+        if forward_mode.is_prefill() and not forward_mode.is_target_verify():
+            self.fla_cu_seqlens = self.forward_metadata.query_start_loc.to(
+                device="cpu", dtype=torch.int64
+            ).tolist()
+            self.fla_chunk_indices = [
+                index
+                for seq, (begin, end) in enumerate(
+                    zip(self.fla_cu_seqlens, self.fla_cu_seqlens[1:])
+                )
+                for chunk in range((end - begin + 63) // 64)
+                for index in (seq, chunk)
+            ]
+            empty_sequences = [
+                seq
+                for seq, (begin, end) in enumerate(
+                    zip(self.fla_cu_seqlens, self.fla_cu_seqlens[1:])
+                )
+                if begin == end
+            ]
+            if empty_sequences:
+                self.fla_empty_seq_indices = torch.tensor(
+                    empty_sequences, dtype=torch.int64, device=cache_indices.device
+                )
+
     def init_forward_metadata_out_graph(
         self,
         forward_batch: ForwardBatch,
@@ -129,7 +155,7 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
         cache_indices = self.forward_metadata.mamba_cache_indices
 
         assert isinstance(mixed_qkv, torch.Tensor)
-        mixed_qkv = causal_conv1d(
+        mixed_qkv = torch.ops.npu.causal_conv1d(
             mixed_qkv,
             self._get_conv_weights_t(layer),
             conv_states=conv_states,
@@ -224,7 +250,7 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
                 dtype=torch.int32,
                 device=mixed_qkv.device,
             )
-            mixed_qkv = causal_conv1d(
+            mixed_qkv = torch.ops.npu.causal_conv1d(
                 mixed_qkv,
                 self._get_conv_weights_t(layer),
                 conv_states=conv_states,
@@ -246,7 +272,7 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
             conv_states_for_prefill = conv_states[
                 :, -(kernel_size - 1) :, :
             ].contiguous()
-            mixed_qkv = causal_conv1d(
+            mixed_qkv = torch.ops.npu.causal_conv1d(
                 mixed_qkv,
                 self._get_conv_weights_t(layer),
                 conv_states=conv_states_for_prefill,
@@ -315,7 +341,13 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
             g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
 
             core_attn_out, last_recurrent_state, h = self.chunk_gdn(
-                query, key, value, g, beta, ssm_states[cache_indices], query_start_loc
+                query,
+                key,
+                value,
+                g,
+                beta,
+                ssm_states[cache_indices],
+                return_intermediate_states=forward_metadata.has_mamba_track_mask,
             )
 
             if last_recurrent_state is not None:
@@ -338,35 +370,59 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
         g,
         beta,
         initial_state,
-        cu_seqlens,
+        *,
+        return_intermediate_states=True,
     ):
-        q = l2norm_fwd(q)  # [T, Nk, Dk]
-        k = l2norm_fwd(k)  # [T, Nk, Dk]
+        from fla_npu.ops.ascendc import npu_chunk_gated_delta_rule_fwd
+
+        # The FLA prepare kernel normalizes raw Q/K. Do not normalize them
+        # again here. use_exp2 selects internal arithmetic; g remains the
+        # natural-log decay produced by fused_gdn_gating.
         g = g.to(torch.float32)  # [T, Nv]
-        scale = k.shape[-1] ** -0.5
 
-        chunk_size = 64
-        chunk_indices = (
-            prepare_chunk_indices(cu_seqlens, chunk_size)
-            if cu_seqlens is not None
-            else None
-        )
-        h = k.new_empty(
-            len(chunk_indices), v.shape[-2], v.shape[-1], k.shape[-1]
-        )  # [NT, NH, DV, Dk]
-
-        core_attn_out, last_recurrent_state = chunk_gated_delta_rule(
-            q,
-            k,
-            v,
-            beta=beta,
+        # SGLang packs all variable-length requests along T. BSND with B=1
+        # preserves this layout without transposing the token and head axes.
+        outputs = npu_chunk_gated_delta_rule_fwd(
+            q.unsqueeze(0),
+            k.unsqueeze(0),
+            v.unsqueeze(0),
+            g.unsqueeze(0),
+            beta.unsqueeze(0),
             initial_state=initial_state,
-            actual_seq_lengths=self.actual_seq_lengths,
-            scale=scale,
-            chunk_state=h,
-            g=g,
+            output_final_state=True,
+            chunk_size=64,
+            cu_seqlens=self.fla_cu_seqlens,
+            chunk_indices=self.fla_chunk_indices,
+            scale=k.shape[-1] ** -0.5,
+            use_exp2=True,
+            use_qk_l2norm_in_kernel=True,
+            use_gate_in_kernel=False,
+            use_beta_sigmoid_in_kernel=False,
+            allow_neg_eigval=False,
+            # FLA 26.10 keeps fused QK normalization but omits backward-only
+            # g_cumsum/A/QK auxiliary outputs when recomputation is allowed.
+            # Prefix snapshots are controlled independently below.
+            disable_recompute=False,
+            return_intermediate_states=return_intermediate_states,
+            state_v_first=True,
+            layout="BSND",
         )
-        return core_attn_out, last_recurrent_state, h
+        core_attn_out, last_recurrent_state = outputs[:2]
+        if self.fla_empty_seq_indices is not None:
+            # FLA does not write final-state rows for zero-length sequences.
+            # Such requests must retain their incoming state in the pool.
+            last_recurrent_state.index_copy_(
+                0,
+                self.fla_empty_seq_indices,
+                initial_state.index_select(0, self.fla_empty_seq_indices),
+            )
+        h = outputs[5]
+        if h is not None:
+            # FLA 26.10: [1, NT, Hv, V, K]; prefix tracking: [NT, Hv, V, K].
+            # FLA stores snapshots in the activation dtype; the existing
+            # tracking code converts selected snapshots to the state dtype.
+            h = h.squeeze(0).contiguous()
+        return core_attn_out.squeeze(0), last_recurrent_state, h
 
     def fused_recurrent_gated_delta_rule_update(
         self,
