@@ -23,6 +23,10 @@ from sglang.srt.hardware_backend.npu.moe.activation import (
     NPUSwigluStepAndMul,
     NPUSwigluWithLimit,
 )
+from sglang.srt.hardware_backend.npu.moe.dual_stream import (
+    record_routed_combine_start,
+    record_routed_gmm2_start,
+)
 from sglang.srt.hardware_backend.npu.moe.routing import (
     INT8_QUANT_MODE,
     npu_moe_finalize_routing,
@@ -294,6 +298,10 @@ class AscendRunnerCore(MoeRunnerCore):
                 )
 
         # --- w2 (down) projection ---
+        # Milestone for the shared-expert dual stream: routed GMM2 is the first
+        # point where the auxiliary stream's Vector activation can overlap a
+        # routed Cube matmul without competing with routed GMM1's Vector work.
+        record_routed_gmm2_start()
         hidden_states = self.config.layer.w2_kernel.apply(
             quant_info,
             hidden_states,
@@ -589,6 +597,7 @@ def post_permute_ascend_to_standard(
     """Weighted top-k sum of the grouped expert output back into ``[T, H]``."""
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
 
+    record_routed_combine_start()
     state = running_state.pop("ascend_routing")
     final_hidden_states = npu_moe_finalize_routing(
         runner_output.hidden_states,
@@ -620,6 +629,7 @@ def post_permute_ascend_to_ascend_ops(
         _AllToAllVState,
     )
 
+    record_routed_combine_start()
     state = running_state.pop("ascend_ops_forward_state", None)
     if state is None:
         raise RuntimeError("Ascend Ops dispatch output is missing forward state")
@@ -658,6 +668,7 @@ def post_permute_ascend_to_deepep_normal(
 ) -> DeepEPNormalCombineInput:
     from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPNormalCombineInput
 
+    record_routed_combine_start()
     return DeepEPNormalCombineInput(
         hidden_states=runner_output.hidden_states,
         topk_ids=running_state["topk_ids"],
@@ -674,6 +685,7 @@ def post_permute_ascend_to_deepep_ll(
 ) -> DeepEPLLCombineInput:
     from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPLLCombineInput
 
+    record_routed_combine_start()
     return DeepEPLLCombineInput(
         hidden_states=runner_output.hidden_states,
         topk_ids=running_state["topk_ids"],

@@ -46,6 +46,20 @@ class _NPULinearMethodBase(LinearMethodBase):
     ):
         self.quant_config = quant_config
 
+    def prepare_input_for_overlap(
+        self, layer: torch.nn.Module, x: torch.Tensor
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        """Pre-quantize ``x`` for a later ``apply`` call, if the scheme can.
+
+        Ascend MoE shared-expert dual streaming wants the Vector activation
+        quantization to run on the auxiliary stream while the routed MoE uses
+        the Cube unit. Returning ``(quantized, scale)`` from here lets the
+        caller pass that tuple straight to ``apply`` (which then skips its own
+        quantization). Returning ``None`` means the scheme has no separable
+        preparation step and ``apply`` must be called with the raw tensor.
+        """
+        return None
+
 
 class NPUW8A8Int8LinearMethod(_NPULinearMethodBase):
     def process_weights_after_loading(self, layer: torch.nn.Module):
@@ -149,6 +163,20 @@ class NPUW8A8Int8DynamicLinearMethod(_NPULinearMethodBase):
         if x.ndim > 2:
             out = out.reshape(*original_shape[:-1], out.shape[-1])
         return out
+
+    def prepare_input_for_overlap(
+        self, layer: torch.nn.Module, x: torch.Tensor
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        """Pre-quantize the activation so ``apply``'s tuple path is used.
+
+        The tuple path of ``apply`` fixes the output dtype to BF16, so only
+        BF16 activations are pre-quantized here; other dtypes keep the exact
+        inference-time behavior of the plain path.
+        """
+        if x.dtype != torch.bfloat16:
+            return None
+        x_2d = x.reshape(-1, x.shape[-1]) if x.ndim > 2 else x
+        return torch.ops.npu.npu_dynamic_quant(x_2d)
 
 
 class NPUMXFP8LinearMethod(_NPULinearMethodBase):
@@ -343,6 +371,22 @@ class NPUMXFP8LinearMethod(_NPULinearMethodBase):
         # Restore original shape (replace last dim with output features)
         output_shape = list(input_shape[:-1]) + [output.shape[-1]]
         return output.reshape(output_shape)
+
+    def prepare_input_for_overlap(
+        self, layer: torch.nn.Module, x: torch.Tensor
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        """Pre-quantize the activation so ``apply``'s tuple path is used.
+
+        ``apply`` quantizes activations with ``npu_dynamic_mx_quant`` (Vector
+        work). Doing it on the auxiliary stream lets it overlap the routed MoE
+        Cube work. The tuple path always produces BF16 output, so only BF16
+        activations are pre-quantized to keep other dtypes byte-identical to
+        the plain path.
+        """
+        if x.dtype != torch.bfloat16:
+            return None
+        x_2d = x.reshape(-1, x.shape[-1])
+        return torch.ops.npu.npu_dynamic_mx_quant(x_2d, dst_type=torch.float8_e4m3fn)
 
 
 def npu_w8a8_mxfp8_linear(

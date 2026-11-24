@@ -114,6 +114,7 @@ from sglang.srt.models.utils import (
 )
 from sglang.srt.runtime_context import (
     get_exec,
+    get_forward,
     get_parallel,
     get_stream,
 )
@@ -609,18 +610,60 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
     # ------------------------------------------------------------------
     # Fine-grained NPU shared-expert stages (npu/moe/dual_stream.py)
     # ------------------------------------------------------------------
-    def _npu_shared_gate_up(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    @staticmethod
+    def _npu_prepare_overlap_input(
+        layer: torch.nn.Module, hidden_states: Union[torch.Tensor, Tuple]
+    ):
+        """Run a linear's scheme-owned Vector input preparation, if any.
+
+        Quantized NPU linears expose ``prepare_input_for_overlap``: it returns
+        the ``(quantized, scale)`` pair their ``apply`` accepts, so the
+        activation quantization can be hoisted onto the auxiliary stream. Any
+        other scheme (or dtype) keeps the raw tensor and does its own work
+        inside ``apply``.
+        """
+        if not isinstance(hidden_states, torch.Tensor):
+            # An earlier fused activation already quantized the input.
+            return hidden_states
+        if get_forward().sp_active:
+            # The sequence-parallel column matmul bypasses quant_method.apply,
+            # so it must still receive a plain tensor.
+            return hidden_states
+        method = getattr(layer, "quant_method", None)
+        prepare = getattr(method, "prepare_input_for_overlap", None)
+        if prepare is None:
+            return hidden_states
+        prepared = prepare(layer, hidden_states)
+        return hidden_states if prepared is None else prepared
+
+    def _npu_shared_prepare_gate_up_input(
+        self, hidden_states: torch.Tensor
+    ) -> Union[torch.Tensor, Tuple]:
+        """Shared Gate-Up input prep (Vector), overlapped with the router Cube."""
+        return self._npu_prepare_overlap_input(
+            self.shared_expert.gate_up_proj, hidden_states
+        )
+
+    def _npu_shared_gate_up(
+        self, gate_up_input: Union[torch.Tensor, Tuple]
+    ) -> torch.Tensor:
         """Shared-expert Gate-Up (Cube), queued on the auxiliary stream."""
-        gate_up, _ = self.shared_expert.gate_up_proj(hidden_states)
+        gate_up, _ = self.shared_expert.gate_up_proj(gate_up_input)
         return gate_up
 
     def _npu_shared_act(self, gate_up: torch.Tensor) -> torch.Tensor:
-        """Shared-expert activation (Vector), overlapped with routed Cube."""
+        """Shared-expert activation (Vector), overlapped with routed GMM2."""
         return self.shared_expert.act_fn(gate_up)
 
-    def _npu_shared_down(self, activated: torch.Tensor) -> torch.Tensor:
+    def _npu_shared_prepare_down_input(
+        self, activated: torch.Tensor
+    ) -> Union[torch.Tensor, Tuple]:
+        """Shared Down input prep (Vector), overlapped with routed GMM2."""
+        return self._npu_prepare_overlap_input(self.shared_expert.down_proj, activated)
+
+    def _npu_shared_down(self, down_input: Union[torch.Tensor, Tuple]) -> torch.Tensor:
         """Shared-expert Down projection (Cube), the tail of the aux MLP."""
-        down, _ = self.shared_expert.down_proj(activated)
+        down, _ = self.shared_expert.down_proj(down_input)
         return down
 
     def _npu_apply_shared_gate(
@@ -646,34 +689,49 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Overlap the routed experts with a finely split shared expert.
 
+        Stage order mirrors vllm-ascend:
+
+        1. aux: input quantization (Vector)  |  main: router (Cube)
+        2. aux: Gate-Up (Cube)               |  main: TopK/dispatch (Vector)
+        3. aux: activation (Vector)          |  main: routed GMM2 (Cube)
+        4. aux: Down input prep + Down (Cube) |  main: token combine (Vector)
+
         Runs in eager mode and inside graph capture alike: the schedule uses
         only streams and events, never host synchronization or data-dependent
         branches.
         """
         assert self._npu_dual_stream is not None
         dual = self._npu_dual_stream
+        milestones = dual.new_milestones()
 
-        prepared = dual.prepare_input(hidden_states, torch.clone)
-        # Router (Cube) first, then submit shared Gate-Up behind it so both
-        # Cube matmuls do not compete for the same unit.
+        prepared = dual.prepare_input(
+            hidden_states, self._npu_shared_prepare_gate_up_input, milestones
+        )
+        # Router (Cube) on the main stream while the aux stream quantizes the
+        # shared input (Vector).
         router_logits, _ = self.gate(hidden_states)
+        # Gate-Up is Cube work: hold it until the router Cube matmul is queued,
+        # then let it cover the routed TopK/dispatch window.
+        dual.record_router_output(milestones)
         submitted_gate_up = dual.submit_gate_up(
-            prepared,
-            self._npu_shared_gate_up,
-            after=dual.record_router_output(),
+            prepared, self._npu_shared_gate_up, milestones
         )
 
-        final_hidden_states = self._forward_router_experts(
-            hidden_states, router_logits=router_logits
-        )
+        # The routed runner records the GMM2/combine milestones that pace the
+        # remaining auxiliary-stream stages.
+        with dual.routed_milestones(milestones):
+            final_hidden_states = self._forward_router_experts(
+                hidden_states, router_logits=router_logits
+            )
 
-        shared_output, shared_ready = dual.finish(
-            submitted_gate_up,
-            self._npu_shared_act,
+        submitted_act = dual.submit_activation(
+            submitted_gate_up, self._npu_shared_act, milestones
+        )
+        shared_output, shared_ready = dual.submit_down(
+            submitted_act,
+            self._npu_shared_prepare_down_input,
             self._npu_shared_down,
-            # Gate the clone taken before the routed experts ran, so an
-            # in-place routed update cannot be observed by the shared branch.
-            hidden_states=prepared.hidden_states,
+            milestones=milestones,
             apply_gate_fn=None if use_fused_gate else self._npu_apply_shared_gate,
         )
         dual.join(shared_ready)
@@ -713,21 +771,31 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         )
         shared_output = None
         submitted_gate_up = None
+        prepared_shared_input = None
+        milestones = None
+        shared_event = None
         if hidden_states.shape[0] > 0:
-            prepared_shared_input = (
-                npu_dual_stream.prepare_input(hidden_states, torch.clone)
-                if npu_dual_stream is not None
-                else None
-            )
+            if npu_dual_stream is not None:
+                milestones = npu_dual_stream.new_milestones()
+                # aux: shared input quantization (Vector), overlapping the
+                # router Cube matmul enqueued right after.
+                prepared_shared_input = npu_dual_stream.prepare_input(
+                    hidden_states,
+                    self._npu_shared_prepare_gate_up_input,
+                    milestones,
+                )
+            else:
+                prepared_shared_input = None
             # router_logits: (num_tokens, n_experts)
             router_logits, _ = self.gate(hidden_states)
             if npu_dual_stream is not None:
                 # Gate-Up is Cube work: hold it until the router Cube matmul is
-                # queued, then let it cover the Vector TopK/routing window.
+                # queued, then let it cover the Vector TopK/dispatch window.
+                npu_dual_stream.record_router_output(milestones)
                 submitted_gate_up = npu_dual_stream.submit_gate_up(
                     prepared_shared_input,
                     self._npu_shared_gate_up,
-                    after=npu_dual_stream.record_router_output(),
+                    milestones,
                 )
             elif enable_cuda_shared_overlap:
                 current_stream = torch.cuda.current_stream()
@@ -746,18 +814,30 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         else:
             topk_output = self.topk.empty_topk_output(hidden_states.device)
         trace_sync("pre_experts")
-        final_hidden_states = self.experts(
-            hidden_states=hidden_states,
-            topk_output=topk_output,
-        )
+        if npu_dual_stream is not None:
+            with npu_dual_stream.routed_milestones(milestones):
+                final_hidden_states = self.experts(
+                    hidden_states=hidden_states,
+                    topk_output=topk_output,
+                )
+        else:
+            final_hidden_states = self.experts(
+                hidden_states=hidden_states,
+                topk_output=topk_output,
+            )
         trace_sync("post_experts")
         if npu_dual_stream is not None and submitted_gate_up is not None:
             assert prepared_shared_input is not None
-            shared_output, shared_ready = npu_dual_stream.finish(
-                submitted_gate_up,
-                self._npu_shared_act,
+            # aux: activation (Vector) once routed GMM2 (Cube) starts, then
+            # Down input prep + Down (Cube) once the routed combine starts.
+            submitted_act = npu_dual_stream.submit_activation(
+                submitted_gate_up, self._npu_shared_act, milestones
+            )
+            shared_output, shared_ready = npu_dual_stream.submit_down(
+                submitted_act,
+                self._npu_shared_prepare_down_input,
                 self._npu_shared_down,
-                hidden_states=prepared_shared_input.hidden_states,
+                milestones=milestones,
                 apply_gate_fn=self._npu_apply_shared_gate,
             )
             npu_dual_stream.join(shared_ready)
