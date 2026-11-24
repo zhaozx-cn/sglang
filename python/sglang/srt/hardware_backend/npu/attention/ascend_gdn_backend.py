@@ -20,6 +20,18 @@ from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 
 
 class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
+    """Gated-delta-net linear attention on Ascend NPU.
+
+    Breakable prefill graphs (``--cuda-graph-backend-prefill=breakable``) keep
+    the GDN extend out of the captured segments. The FLA chunk launcher reads
+    ``cu_seqlens`` / ``chunk_indices`` as host int arrays, which an NPU graph
+    segment cannot consume, so ``supports_prefill_graph_extend`` stays False and
+    ``RadixLinearAttention`` calls back into this backend through its
+    ``@eager_on_graph`` break: the surrounding segments replay from graph-pool
+    buffers while the GDN body re-runs eagerly against the live batch metadata
+    that ``init_forward_metadata`` rebuilt for this replay.
+    """
+
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
         self.conv_states_shape = torch.Size(
@@ -35,6 +47,11 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
         decode_backend = backends.decode
         prefill_backend = backends.prefill
         self.kernel_dispatcher = GDNKernelDispatcher(decode_backend, prefill_backend)
+
+    def supports_prefill_graph_extend(self) -> bool:
+        # FLA needs host-side varlen tables; capturing the extend would freeze
+        # the capture bucket's sequence layout. Keep the per-layer eager break.
+        return False
 
     def _prepare_mamba_track_metadata(self, forward_batch: ForwardBatch):
         if self.forward_metadata.has_mamba_track_mask:
@@ -77,6 +94,9 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
         # The FLA launcher consumes host int arrays. Prepare them once per
         # forward, rather than synchronizing the same sequence boundaries in
         # every GDN layer. Decode and target verify keep their existing paths.
+        # Breakable prefill graphs never reach this at capture time: metadata
+        # init runs outside the segments and the GDN body itself replays as an
+        # eager break, so these tables always describe the live batch.
         self.fla_cu_seqlens = None
         self.fla_chunk_indices = None
         self.fla_empty_seq_indices = None
