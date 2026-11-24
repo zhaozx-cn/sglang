@@ -1,4 +1,4 @@
-"""Manual NPU checks for the FLA A5 Ascend GDN prefill integration.
+"""Manual NPU checks for FLA A5 GDN prefill and Conv1D output layouts.
 
 Run in the SGLang environment after sourcing CANN, with an idle NPU selected:
     ASCEND_RT_VISIBLE_DEVICES=0 python test_fla_a5_gdn_backend.py
@@ -38,6 +38,72 @@ def make_backend(lengths, slots=None):
     )
     backend.prepare_gdn_inputs(len(lengths), ForwardMode.EXTEND, None)
     return backend
+
+
+def make_extend_case(
+    lengths, *, heads=2, value_dim=128, kernel_size=4, state_len=3, bias=False
+):
+    slots = list(reversed(range(len(lengths))))
+    backend = make_backend(lengths, slots)
+    backend.graph_mode = False
+    md = backend.forward_metadata
+    md.retrieve_next_token = md.retrieve_next_sibling = md.retrieve_parent_token = None
+    md.has_mamba_track_mask = False
+    value_heads = 2 * heads
+    channels = 2 * heads * 128 + value_heads * value_dim
+    layer = SimpleNamespace(
+        layer_id=0,
+        q_dim=heads * 128,
+        k_dim=heads * 128,
+        v_dim=value_heads * value_dim,
+        num_q_heads=heads,
+        num_k_heads=heads,
+        num_v_heads=value_heads,
+        head_q_dim=128,
+        head_k_dim=128,
+        head_v_dim=value_dim,
+        conv_weights=torch.randn(
+            channels, kernel_size, device="npu", dtype=torch.bfloat16
+        )
+        * 0.1,
+        bias=(
+            torch.randn(channels, device="npu", dtype=torch.bfloat16) * 0.1
+            if bias
+            else None
+        ),
+        A_log=torch.zeros(value_heads, device="npu"),
+        dt_bias=torch.zeros(value_heads, device="npu", dtype=torch.bfloat16),
+    )
+    cache = SimpleNamespace(
+        conv=[
+            torch.randn(
+                len(lengths) + 1,
+                state_len,
+                channels,
+                device="npu",
+                dtype=torch.bfloat16,
+            )
+            * 0.1
+        ],
+        temporal=torch.randn(
+            len(lengths) + 1,
+            value_heads,
+            value_dim,
+            128,
+            device="npu",
+            dtype=torch.float32,
+        )
+        * 0.01,
+    )
+    backend.state_layer_cache = lambda layer_id: cache
+    batch = SimpleNamespace(
+        forward_mode=ForwardMode.EXTEND,
+        extend_prefix_lens=torch.zeros(len(lengths), device="npu", dtype=torch.int32),
+    )
+    raw = torch.randn(sum(lengths), channels, device="npu", dtype=torch.bfloat16)
+    a = torch.randn(sum(lengths), value_heads, device="npu", dtype=torch.bfloat16)
+    b = torch.randn_like(a)
+    return backend, layer, cache, batch, raw, a, b
 
 
 def oracle(q, k, v, g, beta, initial, lengths):
@@ -312,6 +378,120 @@ class TestFlaA5GDNBackend(unittest.TestCase):
         self.assertIsNone(backend.fla_chunk_indices)
         self.assertIsNone(backend.fla_empty_seq_indices)
 
+    @torch.inference_mode()
+    def test_prefill_head_first_matches_token_first(self):
+        cases = [
+            ([1, 2, 0, 65], 2, 128, 4, 5, True),
+            ([63, 64, 65], 4, 128, 3, 4, False),
+            ([65, 3], 16, 128, 2, 2, True),
+        ]
+        for lengths, heads, value_dim, width, state_len, bias in cases:
+            with self.subTest(lengths=lengths, heads=heads, value_dim=value_dim):
+                backend, layer, cache, batch, raw, a, b = make_extend_case(
+                    lengths,
+                    heads=heads,
+                    value_dim=value_dim,
+                    kernel_size=width,
+                    state_len=state_len,
+                    bias=bias,
+                )
+                batch.extend_prefix_lens[::2] = 7
+                before_raw = raw.clone()
+                expected_conv = cache.conv[0].clone()
+                expected_state = cache.temporal.clone()
+                conv_tail = expected_conv[:, -(width - 1) :, :].contiguous()
+                md = backend.forward_metadata
+                convolved = torch.ops.npu.causal_conv1d(
+                    raw,
+                    backend._get_conv_weights_t(layer),
+                    conv_states=conv_tail,
+                    bias=layer.bias,
+                    query_start_loc=md.query_start_loc,
+                    cache_indices=md.mamba_cache_indices,
+                    has_initial_state=batch.extend_prefix_lens > 0,
+                    activation_mode=1,
+                    pad_slot_id=-1,
+                    run_mode=0,
+                )
+                expected_conv[:, -(width - 1) :, :] = conv_tail
+                q, k, v = convolved.split(
+                    [layer.q_dim, layer.k_dim, layer.v_dim], dim=-1
+                )
+                g, beta = fused_gdn_gating_npu(layer.A_log, a, b, layer.dt_bias)
+                expected, final, _ = backend.chunk_gdn(
+                    q.reshape(-1, heads, 128).contiguous(),
+                    k.reshape(-1, heads, 128).contiguous(),
+                    v.reshape(-1, 2 * heads, value_dim).contiguous(),
+                    g,
+                    beta,
+                    expected_state[md.mamba_cache_indices],
+                    return_intermediate_states=False,
+                )
+                expected_state[md.mamba_cache_indices] = final
+                actual = backend.forward_extend(layer, batch, raw, a, b)
+                torch.npu.synchronize()
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                torch.testing.assert_close(cache.conv[0], expected_conv, rtol=0, atol=0)
+                torch.testing.assert_close(
+                    cache.temporal, expected_state, rtol=0, atol=0
+                )
+                torch.testing.assert_close(raw, before_raw, rtol=0, atol=0)
+
+    @torch.inference_mode()
+    def test_prefill_conv_unequal_head_dimensions(self):
+        # The installed A5 GDN build only accepts V=128. Check the Conv1D
+        # adapter independently for an unequal V width, without invoking GDN.
+        backend, layer, cache, batch, raw, a, b = make_extend_case(
+            [65, 3], value_dim=256
+        )
+        md = backend.forward_metadata
+        expected_conv = cache.conv[0].clone()
+        expected = torch.ops.npu.causal_conv1d(
+            raw,
+            backend._get_conv_weights_t(layer),
+            conv_states=expected_conv,
+            query_start_loc=md.query_start_loc,
+            cache_indices=md.mamba_cache_indices,
+            has_initial_state=batch.extend_prefix_lens > 0,
+            activation_mode=1,
+            pad_slot_id=-1,
+            run_mode=0,
+        )
+        expected_qkv = expected.split([layer.q_dim, layer.k_dim, layer.v_dim], dim=-1)
+
+        def check_inputs(q, k, v, g, beta, initial, *, qkv_layout, **kwargs):
+            self.assertEqual(qkv_layout, "BSND")
+            for actual, reference in zip((q, k, v), expected_qkv):
+                torch.testing.assert_close(
+                    actual.reshape(reference.shape), reference, rtol=0, atol=0
+                )
+            return v, None, None
+
+        backend.chunk_gdn = check_inputs
+        backend.forward_extend(layer, batch, raw, a, b)
+        torch.testing.assert_close(cache.conv[0], expected_conv, rtol=0, atol=0)
+
+    @torch.inference_mode()
+    def test_prefill_conv_chunked_continuation(self):
+        backend, layer, cache, batch, raw, a, b = make_extend_case([129])
+        initial_conv = cache.conv[0].clone()
+        initial_state = cache.temporal.clone()
+        full = backend.forward_extend(layer, batch, raw, a, b)
+        full_conv = cache.conv[0].clone()
+        full_state = cache.temporal.clone()
+        cache.conv[0].copy_(initial_conv)
+        cache.temporal.copy_(initial_state)
+        md = backend.forward_metadata
+        md.query_start_loc = torch.tensor([0, 64], device="npu", dtype=torch.int32)
+        backend.prepare_gdn_inputs(1, ForwardMode.EXTEND, None)
+        first = backend.forward_extend(layer, batch, raw[:64], a[:64], b[:64])
+        md.query_start_loc = torch.tensor([0, 65], device="npu", dtype=torch.int32)
+        backend.prepare_gdn_inputs(1, ForwardMode.EXTEND, None)
+        batch.extend_prefix_lens.fill_(64)
+        second = backend.forward_extend(layer, batch, raw[64:], a[64:], b[64:])
+        self.assert_numeric("conv_chunked/output", torch.cat((first, second)), full)
+        self.assert_numeric("conv_chunked/state", cache.temporal, full_state)
+        torch.testing.assert_close(cache.conv[0], full_conv, rtol=0, atol=0)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

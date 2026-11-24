@@ -272,17 +272,28 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
             conv_states_for_prefill = conv_states[
                 :, -(kernel_size - 1) :, :
             ].contiguous()
+
+            # A single head-first output can pack Q/K/V when their head
+            # dimensions match. Keep token-first output for unequal widths.
+            conv_head_num = (
+                layer.num_q_heads + layer.num_k_heads + layer.num_v_heads
+                if layer.head_q_dim == layer.head_k_dim == layer.head_v_dim
+                else 0
+            )
+            qkv_layout = "BNSD" if conv_head_num else "BSND"
             mixed_qkv = torch.ops.npu.causal_conv1d(
                 mixed_qkv,
                 self._get_conv_weights_t(layer),
-                conv_states=conv_states_for_prefill,
                 bias=layer.bias,
+                conv_states=conv_states_for_prefill,
                 query_start_loc=query_start_loc,
                 cache_indices=cache_indices,
                 has_initial_state=has_initial_states,
                 activation_mode=1,
                 pad_slot_id=-1,
                 run_mode=0,
+                output_layout="HEAD_FIRST" if conv_head_num else "TOKEN_FIRST",
+                head_num=conv_head_num,
             )
             conv_states[:, -(kernel_size - 1) :, :] = conv_states_for_prefill
         if is_target_verify:
@@ -322,22 +333,27 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
                     dim=0,
                 )
         else:
-            query, key, value = torch.split(
-                mixed_qkv,
-                [layer.q_dim, layer.k_dim, layer.v_dim],
-                dim=-1,
-            )
+            if qkv_layout == "BNSD":
+                query, key, value = mixed_qkv.split(
+                    [layer.num_q_heads, layer.num_k_heads, layer.num_v_heads], dim=0
+                )
+            else:
+                query, key, value = torch.split(
+                    mixed_qkv,
+                    [layer.q_dim, layer.k_dim, layer.v_dim],
+                    dim=-1,
+                )
 
-            actual_seq_len = query.shape[0]
-            query = query.view(
-                actual_seq_len, layer.num_q_heads, layer.head_q_dim
-            ).contiguous()
-            key = key.view(
-                actual_seq_len, layer.num_k_heads, layer.head_k_dim
-            ).contiguous()
-            value = value.view(
-                actual_seq_len, layer.num_v_heads, layer.head_v_dim
-            ).contiguous()
+                actual_seq_len = query.shape[0]
+                query = query.view(
+                    actual_seq_len, layer.num_q_heads, layer.head_q_dim
+                ).contiguous()
+                key = key.view(
+                    actual_seq_len, layer.num_k_heads, layer.head_k_dim
+                ).contiguous()
+                value = value.view(
+                    actual_seq_len, layer.num_v_heads, layer.head_v_dim
+                ).contiguous()
             g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
 
             core_attn_out, last_recurrent_state, h = self.chunk_gdn(
@@ -348,6 +364,7 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
                 beta,
                 ssm_states[cache_indices],
                 return_intermediate_states=forward_metadata.has_mamba_track_mask,
+                qkv_layout=qkv_layout,
             )
 
             if last_recurrent_state is not None:
@@ -372,6 +389,7 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
         initial_state,
         *,
         return_intermediate_states=True,
+        qkv_layout="BSND",
     ):
         from fla_npu.ops.ascendc import npu_chunk_gated_delta_rule_fwd
 
@@ -380,8 +398,8 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
         # natural-log decay produced by fused_gdn_gating.
         g = g.to(torch.float32)  # [T, Nv]
 
-        # SGLang packs all variable-length requests along T. BSND with B=1
-        # preserves this layout without transposing the token and head axes.
+        # Variable-length requests share physical B=1. SGL Conv1D already
+        # writes head-first Q/K/V; g and beta always remain token-first.
         outputs = npu_chunk_gated_delta_rule_fwd(
             q.unsqueeze(0),
             k.unsqueeze(0),
@@ -405,7 +423,7 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
             disable_recompute=False,
             return_intermediate_states=return_intermediate_states,
             state_v_first=True,
-            layout="BSND",
+            layout=qkv_layout,
         )
         core_attn_out, last_recurrent_state = outputs[:2]
         if self.fla_empty_seq_indices is not None:
