@@ -7,15 +7,26 @@ from sgl_kernel_npu.operators.attention.gdn import (
     recurrent_gated_delta_rule,
 )
 
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.ascend_hybrid_linear_attn_backend import (
     AscendMambaAttnBackendBase,
+)
+from sglang.srt.hardware_backend.npu.attention.gdn_prefill_graph import (
+    GDNPrefillGraphMetadata,
+    fla_gdn_padded_metadata_supported,
 )
 from sglang.srt.layers.attention.linear.gdn_backend import GDNKernelDispatcher
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.mem_cache.memory_pool import MambaPool
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    Phase,
+    check_cuda_graph_backend,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 
 
@@ -37,17 +48,21 @@ def _canonical_chunk_indices(cu_seqlens, chunk_size: int):
 class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
     """Gated-delta-net linear attention on Ascend NPU.
 
-    Breakable prefill graphs (``--cuda-graph-backend-prefill=breakable``) keep
-    the GDN extend out of the captured segments. The FLA chunk launcher takes
-    ``cu_seqlens`` / ``chunk_indices`` as int64 **device** tensors (the kernel
-    reads them from GM and host tiling only uses their shapes), but the number
-    of chunks is data dependent and sizes the FLA workspace, so the extent of
-    the metadata cannot vary inside a captured segment. ``supports_prefill_graph_extend``
-    therefore stays False and ``RadixLinearAttention`` calls back into this
-    backend through its ``@eager_on_graph`` break: the surrounding segments
-    replay from graph-pool buffers while the GDN body re-runs eagerly against
-    the live batch metadata that ``init_forward_metadata`` rebuilt for this
-    replay.
+    Breakable prefill graphs (``--cuda-graph-backend-prefill=breakable``) can
+    capture the GDN extend when this build supports it: the launcher reads
+    ``cu_seqlens`` / ``chunk_indices`` as int64 **device** tensors, and a captured
+    segment re-reads them by address, so they live in per-bucket capacity tables
+    that ``gdn_prefill_graph.py`` refreshes in place before each replay. The
+    number of chunks is data dependent, so the tables are padded up to the
+    bucket's worst case and the FLA operator clamps its task space to the chunks
+    ``cu_seqlens`` describes (``GDN_PADDED_METADATA_SUPPORTED``). Prefix-cache
+    tracking uses fixed-length tables of the same bucket: rows the batch does not
+    track read input row 0 and write the reserved state-pool row, so every replay
+    copies the same number of rows. When the extend is not captured,
+    ``RadixLinearAttention`` calls back into this backend through its
+    ``@eager_on_graph`` break: the surrounding segments replay from graph-pool
+    buffers while the GDN body re-runs eagerly against the live batch metadata
+    that ``init_forward_metadata`` rebuilt for this replay.
     """
 
     def __init__(self, model_runner: ModelRunner):
@@ -65,12 +80,106 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
         decode_backend = backends.decode
         prefill_backend = backends.prefill
         self.kernel_dispatcher = GDNKernelDispatcher(decode_backend, prefill_backend)
+        # Captured prefill extend: the capacity tables live here once a bucket is
+        # captured, and are refreshed in place before every replay.
+        self.prefill_graph_metadata: Optional[GDNPrefillGraphMetadata] = None
+        self.prefill_graph_max_seqs = envs.SGLANG_GDN_PREFILL_GRAPH_MAX_SEQS.get()
 
     def supports_prefill_graph_extend(self) -> bool:
-        # The FLA chunk count is data dependent and sizes its workspace, so the
-        # metadata extent would freeze to the capture bucket's sequence layout.
-        # Keep the per-layer eager break.
-        return False
+        return (
+            envs.SGLANG_ENABLE_GDN_PREFILL_GRAPH_EXTEND.get()
+            # Draft workers keep their eager GDN extend; only the target's is
+            # captured.
+            and not self.is_draft_worker
+            and self._prefill_graph_extend_supported()
+        )
+
+    def _prefill_graph_extend_supported(self) -> bool:
+        """Whether this build can run the GDN extend on captured capacity tables.
+
+        The tables live in ``gdn_prefill_graph.py``; the FLA operator must clamp its
+        task space to the chunks ``cu_seqlens`` describes (padded chunk rows must
+        never be decoded), which ``GDN_PADDED_METADATA_SUPPORTED`` advertises.
+        Prefix-cache tracking runs on fixed-length tables of the same bucket, so it
+        is part of the captured region; CP/DCP layouts are not.
+        """
+
+        if not check_cuda_graph_backend(Phase.PREFILL, Backend.BREAKABLE):
+            return False
+        if not fla_gdn_padded_metadata_supported():
+            return False
+        parallel = get_parallel()
+        if parallel.attn_cp_size != 1 or parallel.attn_dcp_size != 1:
+            return False
+        return True
+
+    def prefill_graph_extend_active(self) -> bool:
+        return getattr(self, "prefill_graph_metadata", None) is not None
+
+    def init_prefill_graph_metadata(self, forward_batch: ForwardBatch):
+        """Capture-time entry: allocate this bucket's capacity tables."""
+
+        live = getattr(self, "forward_metadata", None)
+        cache_indices = getattr(live, "mamba_cache_indices", None)
+        meta = GDNPrefillGraphMetadata.allocate(
+            num_tokens=int(forward_batch.input_ids.shape[0]),
+            max_seqs_cap=self.prefill_graph_max_seqs,
+            device=self.device,
+            cache_index_dtype=(
+                cache_indices.dtype if cache_indices is not None else torch.int32
+            ),
+            conv_len=int(self.conv_states_shape[-1]),
+            # Prefix-cache snapshots need fixed-length tables; allocate them
+            # whenever the model runs with the extra mamba buffer, even if the
+            # capture batch itself tracks nothing.
+            track=bool(get_exec().mamba.enable_mamba_extra_buffer),
+        )
+        self._bind_prefill_graph_metadata(meta, forward_batch)
+        return meta
+
+    def refresh_prefill_graph_metadata(
+        self, meta: GDNPrefillGraphMetadata, forward_batch: ForwardBatch
+    ) -> None:
+        """Replay-time entry: refresh the captured tables in place."""
+
+        self._bind_prefill_graph_metadata(meta, forward_batch)
+
+    def _bind_prefill_graph_metadata(
+        self, meta: GDNPrefillGraphMetadata, forward_batch: ForwardBatch
+    ) -> None:
+        # Rebuild the live metadata first (the eager breaks around the captured
+        # segments still read it), then let prepare_gdn_inputs() bind the static
+        # tables over the per-forward ones.
+        self.prefill_graph_metadata = meta
+        if not self.can_replay_prefill_graph(forward_batch):
+            raise ValueError(
+                "GDN prefill graph batch does not fit its captured bucket "
+                f"({forward_batch.extend_seq_lens_cpu} vs "
+                f"{meta.max_seqs} seqs / {meta.num_tokens} tokens)"
+            )
+        self.init_forward_metadata(forward_batch)
+        # Fold this batch's tracking plan into the fixed-length tables (rows the
+        # batch does not use become no-ops writing the reserved padding row).
+        live = self.forward_metadata
+        plan = None
+        if getattr(live, "has_mamba_track_mask", False):
+            plan = {
+                "conv_indices": getattr(live, "track_conv_indices", None),
+                "conv_dst": getattr(live, "conv_states_mask_indices", None),
+                "h_row": getattr(live, "track_ssm_h_src", None),
+                "h_dst": getattr(live, "track_ssm_h_dst", None),
+                "final_src": getattr(live, "track_ssm_final_src", None),
+                "final_dst": getattr(live, "track_ssm_final_dst", None),
+            }
+        meta.fill_track(plan)
+        self.graph_mode = True
+
+    def can_replay_prefill_graph(self, forward_batch: ForwardBatch) -> bool:
+        lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
+        meta = getattr(self, "prefill_graph_metadata", None)
+        if lens is None or meta is None:
+            return False
+        return meta.can_fit(lens)
 
     def _prepare_mamba_track_metadata(self, forward_batch: ForwardBatch):
         if self.forward_metadata.has_mamba_track_mask:
@@ -158,6 +267,19 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
         self.fla_chunk_indices = None
         self.fla_empty_seq_indices = None
         if forward_mode.is_prefill() and not forward_mode.is_target_verify():
+            if self.prefill_graph_extend_active() and forward_batch is not None:
+                # Captured extend: refresh this bucket's capacity tables in place.
+                # The GDN body reads these addresses from the graph, so they must
+                # be the static buffers, never per-forward tensors.
+                meta = self.prefill_graph_metadata
+                meta.fill(
+                    extend_seq_lens=list(forward_batch.extend_seq_lens_cpu),
+                    cache_indices=cache_indices,
+                    extend_prefix_lens=forward_batch.extend_prefix_lens,
+                )
+                self.fla_cu_seqlens = meta.cu_seqlens
+                self.fla_chunk_indices = meta.chunk_indices
+                return
             query_start_loc = self.forward_metadata.query_start_loc
             host_cu_seqlens = self._host_cu_seqlens(forward_batch, query_start_loc)
             chunk_indices = _canonical_chunk_indices(host_cu_seqlens, 64)
@@ -289,6 +411,11 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
         seq_len = mixed_qkv.shape[0]
         is_target_verify = forward_batch.forward_mode.is_target_verify()
         forward_metadata = self.forward_metadata
+        # Set when this forward runs on a captured prefill bucket: the segment
+        # reads the bucket's capacity tables, including the tracking tables.
+        prefill_graph_meta = (
+            self.prefill_graph_metadata if self.prefill_graph_extend_active() else None
+        )
 
         query_start_loc = forward_metadata.query_start_loc
         cache_indices = forward_metadata.mamba_cache_indices
@@ -312,6 +439,12 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
             )
         else:
             has_initial_states = forward_batch.extend_prefix_lens > 0
+            if prefill_graph_meta is not None:
+                # Captured extend: the segment reads the bucket's capacity
+                # tables, so the surrounding eager work uses them too.
+                query_start_loc = prefill_graph_meta.cu_seqlens
+                cache_indices = prefill_graph_meta.cache_indices
+                has_initial_states = prefill_graph_meta.has_initial_state
         if is_target_verify:
             num_token_padding = mixed_qkv.shape[0]
             if (
@@ -344,7 +477,14 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
                 run_mode=1,
             )
         else:
-            if forward_metadata.has_mamba_track_mask:
+            if prefill_graph_meta is not None and prefill_graph_meta.track:
+                # Captured tracking: fixed-length gather/scatter over the bucket
+                # tables. Rows this batch does not track read input row 0 and
+                # write the reserved padding slot.
+                conv_states[prefill_graph_meta.track_conv_dst] = mixed_qkv[
+                    prefill_graph_meta.track_conv_indices
+                ].to(conv_states.dtype, copy=False)
+            elif forward_metadata.has_mamba_track_mask:
                 mixed_qkv_to_track = mixed_qkv[forward_metadata.track_conv_indices]
                 conv_states[forward_metadata.conv_states_mask_indices] = (
                     mixed_qkv_to_track
@@ -444,7 +584,11 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
                 g,
                 beta,
                 ssm_states[cache_indices],
-                return_intermediate_states=forward_metadata.has_mamba_track_mask,
+                return_intermediate_states=(
+                    prefill_graph_meta.track
+                    if prefill_graph_meta is not None
+                    else forward_metadata.has_mamba_track_mask
+                ),
                 qkv_layout=qkv_layout,
             )
 
@@ -453,7 +597,11 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
                     ssm_states.dtype, copy=False
                 )
                 ssm_states[cache_indices] = last_recurrent_state
-            if h is not None:
+            if prefill_graph_meta is not None and prefill_graph_meta.track:
+                # Same two snapshots the eager path copies, over fixed-length
+                # tables so the captured segment has no per-batch shapes.
+                prefill_graph_meta.apply_track(ssm_states, h)
+            elif h is not None:
                 self._track_mamba_state_extend(
                     forward_batch, h, ssm_states, forward_metadata
                 )
@@ -509,7 +657,16 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
             layout=qkv_layout,
         )
         core_attn_out, last_recurrent_state = outputs[:2]
-        if self.fla_empty_seq_indices is not None:
+        if self.prefill_graph_extend_active():
+            # Capacity rows: zero-length sequences (and the padded tail) keep the
+            # state they came in with, and the padded rows land on the pad slot
+            # when the caller writes the result back.
+            last_recurrent_state = torch.where(
+                self.prefill_graph_metadata.empty_mask[:, None, None, None],
+                initial_state,
+                last_recurrent_state,
+            )
+        elif self.fla_empty_seq_indices is not None:
             # FLA does not write final-state rows for zero-length sequences.
             # Such requests must retain their incoming state in the pool.
             last_recurrent_state.index_copy_(

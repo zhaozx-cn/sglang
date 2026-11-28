@@ -514,5 +514,111 @@ class TestFlaA5GDNBackend(unittest.TestCase):
         self.assert_numeric("conv_chunked/state", cache.temporal, full_state)
         torch.testing.assert_close(cache.conv[0], full_conv, rtol=0, atol=0)
 
+class PrefillGraphMetadataTest(unittest.TestCase):
+    """Capacity tables read by a captured GDN extend."""
+
+    def test_capacity_tables(self):
+        from sglang.srt.hardware_backend.npu.attention.gdn_prefill_graph import (
+            GDNPrefillGraphMetadata,
+            chunk_capacity,
+        )
+
+        cases = {
+            (65, 3): ([0, 65, 68], [0, 0, 0, 1, 1, 0]),
+            (1, 64): ([0, 1, 65], [0, 0, 1, 0]),
+            (64, 64, 64): ([0, 64, 128, 192], [0, 0, 1, 0, 2, 0]),
+        }
+        for lens, (want_cu, want_rows) in cases.items():
+            with self.subTest(lengths=lens):
+                max_seqs_cap = len(lens) + 2
+                meta = GDNPrefillGraphMetadata.allocate(
+                    num_tokens=sum(lens),
+                    max_seqs_cap=max_seqs_cap,
+                    device=torch.device("npu"),
+                    cache_index_dtype=torch.int32,
+                    conv_len=4,
+                )
+                self.assertEqual(meta.max_chunks, chunk_capacity(sum(lens), max_seqs_cap))
+                meta.fill(extend_seq_lens=list(lens))
+                self.assertTrue(meta.can_fit(list(lens)))
+                self.assertFalse(meta.can_fit([4096]))
+
+                cu = meta.cu_seqlens.tolist()
+                self.assertEqual(cu[: len(lens) + 1], want_cu)
+                # The padded request slots are empty: cu repeats its last value.
+                self.assertEqual(cu[-1], want_cu[-1])
+                self.assertTrue(all(v == want_cu[-1] for v in cu[len(lens) + 1 :]))
+
+                rows = meta.chunk_indices.tolist()
+                self.assertEqual(rows[: len(want_rows)], want_rows)
+                self.assertEqual(int(meta.num_chunks.item()), len(want_rows) // 2)
+                # Every padded row names a chunk whose start is past its sequence
+                # end, so a masking chunk kernel returns on it (valid <= 0).
+                padded = rows[len(want_rows) :]
+                self.assertTrue(padded)
+                for index in range(0, len(padded), 2):
+                    seq, chunk = padded[index], padded[index + 1]
+                    self.assertGreaterEqual(cu[seq] + 64 * chunk, cu[seq + 1])
+
+                mask = meta.empty_mask.tolist()
+                self.assertEqual(mask[: len(lens)], [length == 0 for length in lens])
+                self.assertTrue(all(mask[len(lens) :]))
+
+                # Padded rows point at the reserved state-pool row 0, never at a
+                # live slot.
+                self.assertTrue(
+                    all(v == 0 for v in meta.cache_indices.tolist()[len(lens) :])
+                )
+
+    def test_tracking_tables(self):
+        from sglang.srt.hardware_backend.npu.attention.gdn_prefill_graph import (
+            GDNPrefillGraphMetadata,
+        )
+
+        lens = [65, 3, 64]
+        meta = GDNPrefillGraphMetadata.allocate(
+            num_tokens=sum(lens),
+            max_seqs_cap=6,
+            device=torch.device("npu"),
+            cache_index_dtype=torch.int32,
+            conv_len=4,
+            track=True,
+        )
+        meta.fill(extend_seq_lens=lens)
+        self.assertTrue(meta.track)
+        # Before any plan is folded in, every tracking row is a no-op.
+        self.assertTrue(all(v == 0 for v in meta.track_h_row.tolist()))
+        self.assertTrue(all(v == 0 for v in meta.track_h_dst.tolist()))
+        self.assertTrue(all(v == 0 for v in meta.track_final_dst.tolist()))
+        self.assertEqual(tuple(meta.track_conv_indices.shape), (6, 4))
+
+        # A two-row plan (one chunk-state row, one final-state row) is padded.
+        plan = {
+            "conv_indices": torch.tensor(
+                [[10, 11, 12, 13], [0, 1, 2, 3]], dtype=torch.int64, device="npu"
+            ),
+            "conv_dst": torch.tensor([7, 9], dtype=torch.int64, device="npu"),
+            "h_row": torch.tensor([5, 0], dtype=torch.int64, device="npu"),
+            "h_dst": torch.tensor([11, 0], dtype=torch.int64, device="npu"),
+            "final_src": torch.tensor([0, 13], dtype=torch.int64, device="npu"),
+            "final_dst": torch.tensor([0, 17], dtype=torch.int64, device="npu"),
+        }
+        meta.fill_track(plan)
+        self.assertEqual(meta.track_h_row.tolist(), [5, 0, 0, 0, 0, 0])
+        self.assertEqual(meta.track_h_dst.tolist(), [11, 0, 0, 0, 0, 0])
+        self.assertEqual(meta.track_final_src.tolist(), [0, 13, 0, 0, 0, 0])
+        self.assertEqual(meta.track_final_dst.tolist(), [0, 17, 0, 0, 0, 0])
+        self.assertEqual(meta.track_conv_dst.tolist(), [7, 9, 0, 0, 0, 0])
+        self.assertEqual(meta.track_conv_indices[0].tolist(), [10, 11, 12, 13])
+
+        # apply_track copies exactly max_seqs rows: the two planned ones and the
+        # reserved row for the rest.
+        ssm = torch.arange(24, dtype=torch.float32, device="npu").reshape(24, 1)
+        h = torch.arange(6, dtype=torch.float32, device="npu").reshape(6, 1)
+        meta.apply_track(ssm, h)
+        self.assertEqual(float(ssm[11, 0]), 5.0)
+        self.assertEqual(float(ssm[17, 0]), float(ssm[13, 0]))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
