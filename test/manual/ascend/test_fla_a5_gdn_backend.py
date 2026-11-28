@@ -36,7 +36,12 @@ def make_backend(lengths, slots=None):
             device="npu",
         ),
     )
-    backend.prepare_gdn_inputs(len(lengths), ForwardMode.EXTEND, None)
+    backend.prepare_gdn_inputs(
+        len(lengths),
+        ForwardMode.EXTEND,
+        None,
+        SimpleNamespace(extend_seq_lens_cpu=list(lengths)),
+    )
     return backend
 
 
@@ -365,14 +370,30 @@ class TestFlaA5GDNBackend(unittest.TestCase):
 
     def test_metadata_resets_between_batches(self):
         backend = make_backend([65, 3])
-        self.assertEqual(backend.fla_cu_seqlens, [0, 65, 68])
-        self.assertEqual(backend.fla_chunk_indices, [0, 0, 0, 1, 1, 0])
+        # cu_seqlens/chunk_indices are device int64 tensors now: the FLA kernel
+        # reads them from GM, so the launcher no longer builds host int arrays.
+        self.assertEqual(backend.fla_cu_seqlens.dtype, torch.int64)
+        self.assertEqual(backend.fla_cu_seqlens.device.type, "npu")
+        self.assertEqual(backend.fla_cu_seqlens.tolist(), [0, 65, 68])
+        self.assertEqual(backend.fla_chunk_indices.dtype, torch.int64)
+        self.assertEqual(backend.fla_chunk_indices.device.type, "npu")
+        self.assertEqual(backend.fla_chunk_indices.tolist(), [0, 0, 0, 1, 1, 0])
         backend.forward_metadata.query_start_loc = torch.tensor(
             [0, 1, 65], dtype=torch.int32, device="npu"
         )
+        # Fast path: the scheduler already owns the host-side extend lengths.
+        backend.prepare_gdn_inputs(
+            2,
+            ForwardMode.EXTEND,
+            None,
+            SimpleNamespace(extend_seq_lens_cpu=[1, 64]),
+        )
+        self.assertEqual(backend.fla_cu_seqlens.tolist(), [0, 1, 65])
+        self.assertEqual(backend.fla_chunk_indices.tolist(), [0, 0, 1, 0])
+        # Fallback path: no host lengths, so the device table is read back.
         backend.prepare_gdn_inputs(2, ForwardMode.EXTEND, None)
-        self.assertEqual(backend.fla_cu_seqlens, [0, 1, 65])
-        self.assertEqual(backend.fla_chunk_indices, [0, 0, 1, 0])
+        self.assertEqual(backend.fla_cu_seqlens.tolist(), [0, 1, 65])
+        self.assertEqual(backend.fla_chunk_indices.tolist(), [0, 0, 1, 0])
         backend.prepare_gdn_inputs(2, ForwardMode.DECODE, None)
         self.assertIsNone(backend.fla_cu_seqlens)
         self.assertIsNone(backend.fla_chunk_indices)

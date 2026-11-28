@@ -19,17 +19,35 @@ from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 
 
+def _canonical_chunk_indices(cu_seqlens, chunk_size: int):
+    """Flattened (seq_id, local_chunk_id) pairs in canonical sequence-major order.
+
+    This is the layout the FLA chunk kernels expect for ``chunk_indices``: one
+    pair per chunk, sequences in order and chunks ascending inside a sequence.
+    Empty sequences contribute no pairs.
+    """
+
+    indices = []
+    for seq, (begin, end) in enumerate(zip(cu_seqlens, cu_seqlens[1:])):
+        for chunk in range((end - begin + chunk_size - 1) // chunk_size):
+            indices.extend((seq, chunk))
+    return indices
+
+
 class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
     """Gated-delta-net linear attention on Ascend NPU.
 
     Breakable prefill graphs (``--cuda-graph-backend-prefill=breakable``) keep
-    the GDN extend out of the captured segments. The FLA chunk launcher reads
-    ``cu_seqlens`` / ``chunk_indices`` as host int arrays, which an NPU graph
-    segment cannot consume, so ``supports_prefill_graph_extend`` stays False and
-    ``RadixLinearAttention`` calls back into this backend through its
-    ``@eager_on_graph`` break: the surrounding segments replay from graph-pool
-    buffers while the GDN body re-runs eagerly against the live batch metadata
-    that ``init_forward_metadata`` rebuilt for this replay.
+    the GDN extend out of the captured segments. The FLA chunk launcher takes
+    ``cu_seqlens`` / ``chunk_indices`` as int64 **device** tensors (the kernel
+    reads them from GM and host tiling only uses their shapes), but the number
+    of chunks is data dependent and sizes the FLA workspace, so the extent of
+    the metadata cannot vary inside a captured segment. ``supports_prefill_graph_extend``
+    therefore stays False and ``RadixLinearAttention`` calls back into this
+    backend through its ``@eager_on_graph`` break: the surrounding segments
+    replay from graph-pool buffers while the GDN body re-runs eagerly against
+    the live batch metadata that ``init_forward_metadata`` rebuilt for this
+    replay.
     """
 
     def __init__(self, model_runner: ModelRunner):
@@ -49,8 +67,9 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
         self.kernel_dispatcher = GDNKernelDispatcher(decode_backend, prefill_backend)
 
     def supports_prefill_graph_extend(self) -> bool:
-        # FLA needs host-side varlen tables; capturing the extend would freeze
-        # the capture bucket's sequence layout. Keep the per-layer eager break.
+        # The FLA chunk count is data dependent and sizes its workspace, so the
+        # metadata extent would freeze to the capture bucket's sequence layout.
+        # Keep the per-layer eager break.
         return False
 
     def _prepare_mamba_track_metadata(self, forward_batch: ForwardBatch):
@@ -62,11 +81,43 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
                 forward_batch.mamba_track_indices[mamba_track_mask_indices]
             )
 
+    @staticmethod
+    def _host_cu_seqlens(forward_batch, query_start_loc):
+        """Host mirror of the varlen table, used only to size ``chunk_indices``.
+
+        ``query_start_loc`` lives on the device and the canonical chunk list has
+        a data-dependent length, so its extent cannot be derived on device
+        without a device-to-host read (and that length sizes the FLA tiling).
+        SGLang already owns the extend lengths on the host, and ``extend_start_loc``
+        is exactly their running sum, so the two representations only need to be
+        reconciled when the layout is known to differ (two-batch overlap) or the
+        CPU lengths are unavailable.
+        """
+
+        lens = (
+            getattr(forward_batch, "extend_seq_lens_cpu", None)
+            if forward_batch is not None
+            else None
+        )
+        tbo_range = (
+            getattr(forward_batch, "tbo_parent_token_range", None)
+            if forward_batch is not None
+            else None
+        )
+        expected = int(query_start_loc.numel()) - 1
+        if lens is not None and len(lens) == expected and tbo_range is None:
+            cu = [0]
+            for length in lens:
+                cu.append(cu[-1] + int(length))
+            return cu
+        return query_start_loc.to("cpu", dtype=torch.int64).tolist()
+
     def prepare_gdn_inputs(
         self,
         bs: int,
         forward_mode: ForwardMode,
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+        forward_batch: Optional[ForwardBatch] = None,
     ):
         cache_indices = self.forward_metadata.mamba_cache_indices
         self.num_accept_tokens = torch.ones(
@@ -91,9 +142,15 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
                 self.forward_metadata.query_start_loc
             ).to(torch.int32)
 
-        # The FLA launcher consumes host int arrays. Prepare them once per
-        # forward, rather than synchronizing the same sequence boundaries in
-        # every GDN layer. Decode and target verify keep their existing paths.
+        # FLA consumes cu_seqlens/chunk_indices as int64 *device* tensors now: the
+        # kernel reads them from GM and host tiling only uses their shapes. Build
+        # them once per forward, never per GDN layer.
+        #   * cu_seqlens mirrors query_start_loc on the device (no host int array
+        #     and no device-to-host synchronisation).
+        #   * chunk_indices keeps a data-dependent length (it sizes the FLA
+        #     workspace), so it is materialised from the host-side extend lengths
+        #     the scheduler already owns and uploaded once per forward.
+        # Decode and target verify keep their existing paths.
         # Breakable prefill graphs never reach this at capture time: metadata
         # init runs outside the segments and the GDN body itself replays as an
         # eager break, so these tables always describe the live batch.
@@ -101,21 +158,23 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
         self.fla_chunk_indices = None
         self.fla_empty_seq_indices = None
         if forward_mode.is_prefill() and not forward_mode.is_target_verify():
-            self.fla_cu_seqlens = self.forward_metadata.query_start_loc.to(
-                device="cpu", dtype=torch.int64
-            ).tolist()
-            self.fla_chunk_indices = [
-                index
-                for seq, (begin, end) in enumerate(
-                    zip(self.fla_cu_seqlens, self.fla_cu_seqlens[1:])
+            query_start_loc = self.forward_metadata.query_start_loc
+            host_cu_seqlens = self._host_cu_seqlens(forward_batch, query_start_loc)
+            chunk_indices = _canonical_chunk_indices(host_cu_seqlens, 64)
+            if chunk_indices:
+                self.fla_cu_seqlens = query_start_loc.to(dtype=torch.int64)
+                self.fla_chunk_indices = torch.tensor(
+                    chunk_indices,
+                    dtype=torch.int64,
+                    device=query_start_loc.device,
                 )
-                for chunk in range((end - begin + 63) // 64)
-                for index in (seq, chunk)
-            ]
+            # An all-empty batch has no chunk rows. Keep both tables absent so the
+            # launcher follows its historical degenerate path instead of handing
+            # the operator an empty chunk_indices tensor (which it rejects).
             empty_sequences = [
                 seq
                 for seq, (begin, end) in enumerate(
-                    zip(self.fla_cu_seqlens, self.fla_cu_seqlens[1:])
+                    zip(host_cu_seqlens, host_cu_seqlens[1:])
                 )
                 if begin == end
             ]
@@ -136,6 +195,7 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
             forward_batch.batch_size,
             forward_batch.forward_mode,
             forward_batch.spec_info,
+            forward_batch,
         )
         self._prepare_mamba_track_metadata(forward_batch)
         self.graph_mode = True
@@ -148,6 +208,7 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
             forward_batch.batch_size,
             forward_batch.forward_mode,
             forward_batch.spec_info,
+            forward_batch,
         )
         self._prepare_mamba_track_metadata(forward_batch)
         self.graph_mode = False
@@ -420,6 +481,8 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
 
         # Variable-length requests share physical B=1. SGL Conv1D already
         # writes head-first Q/K/V; g and beta always remain token-first.
+        # cu_seqlens/chunk_indices are int64 device tensors prepared once per
+        # forward in prepare_gdn_inputs (the FLA kernel reads them from GM).
         outputs = npu_chunk_gated_delta_rule_fwd(
             q.unsqueeze(0),
             k.unsqueeze(0),
